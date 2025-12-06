@@ -426,6 +426,6 @@ def main():
     icon = pystray.Icon("IDM-Agent", image, "IDM 下载代理", menu)
     icon.run()
     
-# pyinstaller --onefile --windowed --name IDM-Agent idm-agent-tray.py
+# pyinstaller --onefile --windowed --name IDM-Agent main.py
 if __name__ == '__main__':
     main()

@@ -3,7 +3,6 @@ import os
 import sys
 import time
 import subprocess
-import urllib.parse
 from urllib.parse import urlparse, unquote
 import webbrowser
 import json

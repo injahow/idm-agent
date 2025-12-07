@@ -4,6 +4,7 @@ import sys
 import time
 import subprocess
 import urllib.parse
+from urllib.parse import urlparse, unquote
 import webbrowser
 import json
 import hashlib
@@ -18,8 +19,7 @@ from logging.handlers import TimedRotatingFileHandler
 import pystray
 from PIL import Image, ImageDraw
 import tkinter as tk
-from tkinter import messagebox, filedialog, ttk
-from tkinter.font import Font
+from tkinter import messagebox, filedialog
 
 # 获取程序所在目录
 if getattr(sys, 'frozen', False):
@@ -91,34 +91,60 @@ class StyleConfig:
     SHADOW_EFFECT = 2
 
 # --- 配置 ---
+TIME_WINDOW_MS = 60 * 1000  # 60秒，单位：毫秒
 CONFIG_FILE = os.path.join(app_dir, "idm_agent_config.json")
-TIME_WINDOW_MS = 30 * 1000  # 30秒，单位：毫秒
+DEFAULT_CONFIG = {
+    "secret_key": lambda: secrets.token_urlsafe(32),
+    "idm_path": r"C:\Program Files (x86)\Internet Download Manager\IDMan.exe",
+    "idm_auto_download": False
+}
 
-# --- 配置管理 ---
 def load_config():
+    """智能加载配置：差量合并，默认值填充"""
+    config = {}
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-                if "idm_path" not in config:
-                    config["idm_path"] = r"C:\Program Files (x86)\Internet Download Manager\IDMan.exe"
-                return config
+                file_config = json.load(f)
+                if isinstance(file_config, dict):
+                    config.update(file_config)
+                else:
+                    logger.warning("配置文件格式错误，使用默认配置")
         except Exception as e:
             logger.warning(f"配置加载失败: {e}")
+    for key, default_value in DEFAULT_CONFIG.items():
+        if key not in config:
+            config[key] = default_value() if callable(default_value) else default_value
+    if not os.path.exists(CONFIG_FILE) or _config_needs_update(config):
+        save_config(config)
     
-    config = {
-        "secret_key": secrets.token_urlsafe(32),
-        "idm_path": r"C:\Program Files (x86)\Internet Download Manager\IDMan.exe"
-    }
-    save_config(config)
     return config
 
+def _config_needs_update(current_config):
+    """检查配置是否需要更新"""
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            saved_config = json.load(f)
+        return any(
+            key not in saved_config or saved_config[key] != current_config[key]
+            for key in current_config.keys()
+        )
+    except:
+        return True
+
 def save_config(config):
+    """保存配置"""
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    safe_config = {}
+    safe_config.update(config)
+    for key, default_value in DEFAULT_CONFIG.items():
+        if key not in safe_config:
+            safe_config[key] = default_value() if callable(default_value) else default_value
     try:
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2)
+            json.dump(safe_config, f, indent=4, ensure_ascii=False)
     except Exception as e:
-        logger.error(f"保存配置失败: {e}")
+        logger.error(f"配置保存失败: {e}")
 
 config = load_config()
 
@@ -158,6 +184,41 @@ def verify_md5_signature(params, signature):
     expected_sig = generate_md5_signature(params, current_secret)
     return hmac.compare_digest(expected_sig, signature)
 
+def is_url(url):
+    try:
+        urlparse(url)
+        return True
+    except Exception as e:
+        logger.warning(f"无效的 URL: {url}, err: {e}", exc_info=True)
+        return False
+
+def truncate_filename_with_ext(name, max_length=255):
+    """
+    截断文件名至 max_length
+    """
+    if not isinstance(name, str) or not name:
+        return ""
+    if '.' in name and not name.startswith('.'):
+        parts = name.rsplit('.', 1)
+        basename, ext = parts[0], parts[1]
+    else:
+        basename, ext = name, ""
+    if not ext:
+        return basename[:max_length]
+    max_basename_len = max_length - len(ext) - 1
+    if max_basename_len <= 0:
+        return ext[:max_length]
+    truncated_basename = basename[:max_basename_len]
+    result = f"{truncated_basename}.{ext}"
+    return result
+
+def sanitize_filename(name):
+    bad_chars = '<>:"/\\|?*'
+    for c in bad_chars:
+        name = name.replace(c, '')
+    name = name.lstrip('.')
+    return truncate_filename_with_ext(name)
+
 @app.route('/download', methods=['GET', 'POST'])
 def add_download():
     if request.method == 'POST':
@@ -190,13 +251,21 @@ def add_download():
             logger.error(f"IDM 未找到: {idm_exe}")
             return jsonify({"error": f"IDM 未找到: {idm_exe}"}), 500
 
-        url = urllib.parse.unquote(params['url'])
+        if not params['url'] or not is_url(params['url']):
+            return jsonify({"error": "Invalid URL"}), 400
+        
+        url = unquote(params['url'])
         logger.info(f"合法请求: {url}")
 
         cmd = [idm_exe, "/d", url]
         if params['filename']:
-            filename = urllib.parse.unquote(params['filename'])
-            cmd.extend(["/f", filename])
+            filename = unquote(params['filename'])
+            filename = sanitize_filename(params['filename'])
+            if filename:
+                cmd.extend(["/f", filename])
+
+        if config["idm_auto_download"]:
+            cmd.append("/n")
 
         subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
         return jsonify({"code": 0, "message": "Download sent to IDM"}), 200
@@ -329,19 +398,14 @@ def create_styled_button(parent, text, command, bg_color=StyleConfig.PRIMARY_COL
 def show_custom_message(title, message, msg_type="info", parent=None):
     """统一的消息提示框"""
     if msg_type == "info":
-        icon = messagebox.INFO
         bg = StyleConfig.PRIMARY_COLOR
     elif msg_type == "warning":
-        icon = messagebox.WARNING
         bg = StyleConfig.WARNING_COLOR
     elif msg_type == "error":
-        icon = messagebox.ERROR
         bg = StyleConfig.DANGER_COLOR
     elif msg_type == "success":
-        icon = messagebox.INFO
         bg = StyleConfig.SUCCESS_COLOR
     else:
-        icon = messagebox.INFO
         bg = StyleConfig.PRIMARY_COLOR
     
     # 创建临时窗口用于样式
@@ -378,17 +442,16 @@ def is_autostart_enabled():
 
 def set_autostart(enable=True):
     if not reg:
+        show_custom_message("错误", "无法修改开机自启状态", "error")
         return
     try:
         key = reg.OpenKey(reg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, reg.KEY_WRITE)
         exe_path = os.path.abspath(sys.executable)
         if enable:
             reg.SetValueEx(key, "IDM-Agent", 0, reg.REG_SZ, exe_path)
-            show_custom_message("成功", "开机自启已启用", "success")
         else:
             try:
                 reg.DeleteValue(key, "IDM-Agent")
-                show_custom_message("成功", "开机自启已禁用", "success")
             except FileNotFoundError:
                 pass
         reg.CloseKey(key)
@@ -397,10 +460,18 @@ def set_autostart(enable=True):
         logger.error(f"修改开机自启失败: {e}")
         show_custom_message("错误", f"修改开机自启失败: {str(e)}", "error")
 
+def is_idm_auto_download():
+    return config["idm_auto_download"]
+    
+def set_idm_auto_download(enable=True):
+    config["idm_auto_download"] = enable
+    save_config(config)
+    logger.info(f"IDM自动下载已{'启用' if enable else '禁用'}")
+
 # --- 界面回调函数 ---
 def show_secret_key(icon, item):
     """显示密钥窗口"""
-    root = create_custom_window("🔐 安全密钥 - IDM Agent", 580, 240)
+    root = create_custom_window("安全密钥 - IDM Agent", 580, 240)
     
     # 警告提示框
     warning_frame = tk.Frame(root, bg=StyleConfig.LIGHT_COLOR)
@@ -452,13 +523,11 @@ def show_secret_key(icon, item):
         root.clipboard_clear()
         root.clipboard_append(config["secret_key"])
         root.update()
-        copy_btn.config(text="✓ 已复制", state="disabled")
         show_custom_message("成功", "密钥已复制到剪贴板", "success", root)
-        root.after(1500, lambda: copy_btn.config(text="📋 复制密钥", state="normal"))
-    
+
     copy_btn = create_styled_button(
         btn_frame,
-        "📋 复制密钥",
+        "复制密钥",
         copy_key,
         StyleConfig.PRIMARY_COLOR,
         StyleConfig.WHITE_COLOR,
@@ -469,11 +538,11 @@ def show_secret_key(icon, item):
     # 关闭按钮
     close_btn = create_styled_button(
         btn_frame,
-        "✕ 关闭",
+        "关闭",
         root.destroy,
-        StyleConfig.SECONDARY_COLOR,
+        StyleConfig.PRIMARY_COLOR,
         StyleConfig.WHITE_COLOR,
-        "#5A6268"
+        StyleConfig.HOVER_COLOR
     )
     close_btn.pack(side=tk.LEFT, padx=10)
     
@@ -482,7 +551,7 @@ def show_secret_key(icon, item):
 
 def set_idm_path(icon, item):
     """设置IDM路径窗口"""
-    root = create_custom_window("📁 设置 IDM 路径", 620, 180)
+    root = create_custom_window("设置 IDM 路径", 620, 180)
     
     # 标签
     label = tk.Label(
@@ -524,9 +593,9 @@ def set_idm_path(icon, item):
         path_frame,
         "浏览...",
         browse_file,
-        StyleConfig.SECONDARY_COLOR,
+        StyleConfig.PRIMARY_COLOR,
         StyleConfig.WHITE_COLOR,
-        "#5A6268"
+        StyleConfig.HOVER_COLOR
     )
     browse_btn.pack(side=tk.RIGHT, padx=(10, 0))
     
@@ -555,7 +624,7 @@ def set_idm_path(icon, item):
     
     save_btn = create_styled_button(
         btn_frame,
-        "✅ 保存",
+        "保存",
         save_path,
         StyleConfig.PRIMARY_COLOR,
         StyleConfig.WHITE_COLOR,
@@ -568,9 +637,9 @@ def set_idm_path(icon, item):
         btn_frame,
         "✕ 取消",
         root.destroy,
-        StyleConfig.SECONDARY_COLOR,
+        StyleConfig.PRIMARY_COLOR,
         StyleConfig.WHITE_COLOR,
-        "#5A6268"
+        StyleConfig.HOVER_COLOR
     )
     cancel_btn.pack(side=tk.LEFT, padx=10)
     
@@ -585,6 +654,11 @@ def toggle_autostart(icon, item):
     """切换开机自启"""
     current = is_autostart_enabled()
     set_autostart(not current)
+
+def toggle_idm_auto_download(icon, item):
+    """切换idm自动下载"""
+    current = is_idm_auto_download()
+    set_idm_auto_download(not current)
 
 def regenerate_secret_key(icon, item):
     """重新生成密钥"""
@@ -603,7 +677,8 @@ def regenerate_secret_key(icon, item):
 
 def quit_app(icon, item):
     """退出应用"""
-    if show_custom_message("确认", "确定要退出 IDM Agent 吗？", "question"):
+    result = show_custom_message("确认", "确定要退出 IDM Agent 吗？", "question")
+    if result:
         logger.info("程序正在退出...")
         icon.stop()
         os._exit(0)
@@ -611,6 +686,7 @@ def quit_app(icon, item):
 # --- 主程序 ---
 def run_flask():
     """运行Flask服务"""
+    # 本地测试环境
     app.run(host='127.0.0.1', port=16880, debug=False, threaded=True)
 
 def main():
@@ -625,18 +701,23 @@ def main():
     
     # 创建托盘菜单
     menu = (
-        pystray.MenuItem("🌐 打开 Web UI", open_web_ui),
+        pystray.MenuItem("打开 Web UI", open_web_ui),
         pystray.MenuItem(
-            "🔄 开机自动启动",
+            "开机自动启动",
             toggle_autostart,
             checked=lambda item: is_autostart_enabled()
         ),
+        pystray.MenuItem(
+            "IDM自动下载",
+            toggle_idm_auto_download,
+            checked=lambda item: is_idm_auto_download()
+        ),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("🔑 显示当前密钥", show_secret_key),
-        pystray.MenuItem("🔄 重新生成密钥", regenerate_secret_key),
-        pystray.MenuItem("📁 设置 IDM 路径", set_idm_path),
+        pystray.MenuItem("显示当前密钥", show_secret_key),
+        pystray.MenuItem("重新生成密钥", regenerate_secret_key),
+        pystray.MenuItem("设置 IDM 路径", set_idm_path),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("🚪 退出", quit_app)
+        pystray.MenuItem("退出", quit_app)
     )
     
     # 启动托盘
@@ -656,4 +737,4 @@ if __name__ == '__main__':
     main()
 
 # 打包
-# pyinstaller --onefile --windowed --name IDM-Agent --icon=icon.ico --add-data="icon.ico;." main.py
+# pyinstaller --onefile --windowed --name IDM-Agent main.py

@@ -18,17 +18,21 @@ from logging.handlers import TimedRotatingFileHandler
 import pystray
 from PIL import Image, ImageDraw
 import tkinter as tk
-from tkinter import messagebox, filedialog
+from tkinter import messagebox, filedialog, ttk
+from tkinter.font import Font
 
 # 获取程序所在目录
 if getattr(sys, 'frozen', False):
     app_dir = os.path.dirname(sys.executable)
 else:
     app_dir = os.path.dirname(os.path.abspath(__file__))
+
 # 日志目录
 log_dir = os.path.join(app_dir, "logs")
 os.makedirs(log_dir, exist_ok=True)
 log_path = os.path.join(log_dir, "idm_agent.log")
+
+# --- 日志配置 ---
 logger = logging.getLogger("IDM-Agent")
 logger.setLevel(logging.INFO)
 
@@ -47,6 +51,7 @@ if not logger.handlers:
     )
     file_handler.setFormatter(file_formatter)
     logger.addHandler(file_handler)
+    
     # 控制台日志
     console_handler = logging.StreamHandler()
     console_formatter = logging.Formatter('[%(levelname)s] %(message)s')
@@ -58,6 +63,32 @@ try:
     import winreg as reg
 except ImportError:
     reg = None
+
+# --- 全局样式配置 ---
+class StyleConfig:
+    # 颜色方案
+    PRIMARY_COLOR = "#4A6CF7"      # 主色调（蓝色）
+    SECONDARY_COLOR = "#6C757D"    # 次要颜色（灰色）
+    SUCCESS_COLOR = "#28A745"      # 成功色（绿色）
+    DANGER_COLOR = "#DC3545"       # 危险色（红色）
+    WARNING_COLOR = "#FFC107"      # 警告色（黄色）
+    LIGHT_COLOR = "#F8F9FA"        # 浅色背景
+    DARK_COLOR = "#343A40"         # 深色文字
+    WHITE_COLOR = "#FFFFFF"        # 白色
+    HOVER_COLOR = "#3A5CE7"        # 悬停色
+    
+    # 字体配置
+    FONT_MAIN = ("Microsoft YaHei", 10)
+    FONT_BOLD = ("Microsoft YaHei", 10, "bold")
+    FONT_SMALL = ("Microsoft YaHei", 9)
+    FONT_MONO = ("Consolas", 10)
+    
+    # 尺寸配置
+    WINDOW_PADDING = 20
+    ELEMENT_SPACING = 10
+    BUTTON_PADDING = (20, 6)
+    BORDER_RADIUS = 6
+    SHADOW_EFFECT = 2
 
 # --- 配置 ---
 CONFIG_FILE = os.path.join(app_dir, "idm_agent_config.json")
@@ -74,6 +105,7 @@ def load_config():
                 return config
         except Exception as e:
             logger.warning(f"配置加载失败: {e}")
+    
     config = {
         "secret_key": secrets.token_urlsafe(32),
         "idm_path": r"C:\Program Files (x86)\Internet Download Manager\IDMan.exe"
@@ -116,10 +148,12 @@ def verify_md5_signature(params, signature):
     except (ValueError, TypeError):
         logger.warning("ts 无效")
         return False
+    
     now_ms = int(time.time() * 1000)
     if abs(now_ms - ts) > TIME_WINDOW_MS:
         logger.warning("签名已过期")
         return False
+    
     current_secret = config["secret_key"]
     expected_sig = generate_md5_signature(params, current_secret)
     return hmac.compare_digest(expected_sig, signature)
@@ -173,30 +207,164 @@ def add_download():
 @app.route('/')
 def index():
     return """
-    <h2>IDM Agent 正在运行</h2>
-    <p>接口地址: <code>http://127.0.0.1:16880/download</code></p>
-    <p>参数: <code>url</code>, <code>filename</code> (可选), <code>ts</code> (毫秒时间戳), <code>sign</code></p>
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8">
+        <title>IDM Agent 运行中</title>
+        <style>
+            body { font-family: 'Microsoft YaHei', sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
+            .container { background: #f8f9fa; border-radius: 10px; padding: 30px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            h2 { color: #4A6CF7; margin-bottom: 20px; }
+            code { background: #e9ecef; padding: 2px 6px; border-radius: 4px; color: #DC3545; }
+            .param-box { background: white; padding: 15px; border-radius: 6px; margin: 15px 0; border-left: 4px solid #4A6CF7; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h2>IDM Agent 正在运行</h2>
+            <p>接口地址: <code>http://127.0.0.1:16880/download</code></p>
+            <div class="param-box">
+                <p>必填参数:</p>
+                <ul>
+                    <li><code>url</code>: 下载链接</li>
+                    <li><code>ts</code>: 毫秒时间戳</li>
+                    <li><code>sign</code>: 签名值</li>
+                </ul>
+                <p>可选参数:</p>
+                <ul>
+                    <li><code>filename</code>: 文件名</li>
+                </ul>
+            </div>
+        </div>
+    </body>
+    </html>
     """
 
 # --- 工具函数 ---
 def create_image():
-    ICON_SIZE = (32, 32)    # 32x32正方形（偶数尺寸，居中更易对齐）
-    BG_COLOR = (255, 255, 255)  # 纯白色背景
-    CROSS_COLOR = (0, 0, 0)     # 纯黑色十字线
-    LINE_WIDTH = 4              # 线条宽度（像素）
-    PADDING = 2                 # 十字线与边框的留白
+    """创建托盘图标"""
+    ICON_SIZE = (32, 32)
+    BG_COLOR = (255, 255, 255)
+    CROSS_COLOR = (74, 108, 247)  # 使用主色调
+    LINE_WIDTH = 4
+    PADDING = 2
+    
     image = Image.new("RGB", ICON_SIZE, BG_COLOR)
     draw = ImageDraw.Draw(image)
     center_x = ICON_SIZE[0] / 2 - 0.5
     center_y = ICON_SIZE[1] / 2 - 0.5
+    
+    # 绘制十字线
     horizontal_start = (PADDING, center_y)
     horizontal_end = (ICON_SIZE[0] - PADDING, center_y)
     vertical_start = (center_x, PADDING)
     vertical_end = (center_x, ICON_SIZE[1] - PADDING)
+    
     draw.line([horizontal_start, horizontal_end], fill=CROSS_COLOR, width=LINE_WIDTH, joint="round")
     draw.line([vertical_start, vertical_end], fill=CROSS_COLOR, width=LINE_WIDTH, joint="round")
+    
     return image
 
+def create_custom_window(title, width, height):
+    """创建统一样式的窗口"""
+    root = tk.Tk()
+    root.title(title)
+    root.geometry(f"{width}x{height}")
+    root.resizable(False, False)
+    root.configure(bg=StyleConfig.LIGHT_COLOR)
+    
+    # 设置窗口图标（如果有）
+    try:
+        root.iconphoto(False, tk.PhotoImage(data=create_image().tobytes()))
+    except:
+        pass
+    
+    # 居中显示
+    root.withdraw()
+    root.update_idletasks()
+    screen_width = root.winfo_screenwidth()
+    screen_height = root.winfo_screenheight()
+    x = (screen_width - width) // 2
+    y = (screen_height - height) // 2
+    root.geometry(f"{width}x{height}+{x}+{y}")
+    root.deiconify()
+    
+    return root
+
+def create_styled_button(parent, text, command, bg_color=StyleConfig.PRIMARY_COLOR, 
+                        fg_color=StyleConfig.WHITE_COLOR, hover_color=StyleConfig.HOVER_COLOR):
+    """创建样式统一的按钮"""
+    btn = tk.Button(
+        parent,
+        text=text,
+        command=command,
+        font=StyleConfig.FONT_MAIN,
+        bg=bg_color,
+        fg=fg_color,
+        relief="flat",
+        padx=StyleConfig.BUTTON_PADDING[0],
+        pady=StyleConfig.BUTTON_PADDING[1],
+        cursor="hand2"
+    )
+    
+    # 添加悬停效果
+    def on_enter(e):
+        btn.config(bg=hover_color)
+    
+    def on_leave(e):
+        btn.config(bg=bg_color)
+    
+    btn.bind("<Enter>", on_enter)
+    btn.bind("<Leave>", on_leave)
+    
+    # 圆角效果（模拟）
+    try:
+        btn.config(bd=0, highlightthickness=0)
+    except:
+        pass
+    
+    return btn
+
+def show_custom_message(title, message, msg_type="info", parent=None):
+    """统一的消息提示框"""
+    if msg_type == "info":
+        icon = messagebox.INFO
+        bg = StyleConfig.PRIMARY_COLOR
+    elif msg_type == "warning":
+        icon = messagebox.WARNING
+        bg = StyleConfig.WARNING_COLOR
+    elif msg_type == "error":
+        icon = messagebox.ERROR
+        bg = StyleConfig.DANGER_COLOR
+    elif msg_type == "success":
+        icon = messagebox.INFO
+        bg = StyleConfig.SUCCESS_COLOR
+    else:
+        icon = messagebox.INFO
+        bg = StyleConfig.PRIMARY_COLOR
+    
+    # 创建临时窗口用于样式
+    temp_root = tk.Toplevel(parent) if parent else tk.Tk()
+    temp_root.withdraw()
+    temp_root.configure(bg=bg)
+    
+    # 显示消息框
+    if msg_type == "success":
+        result = messagebox.showinfo(title, message, parent=temp_root)
+    elif msg_type == "warning":
+        result = messagebox.showwarning(title, message, parent=temp_root)
+    elif msg_type == "error":
+        result = messagebox.showerror(title, message, parent=temp_root)
+    elif msg_type == "question":
+        result = messagebox.askyesno(title, message, parent=temp_root)
+    else:
+        result = messagebox.showinfo(title, message, parent=temp_root)
+    
+    temp_root.destroy()
+    return result
+
+# --- 注册表相关 ---
 def is_autostart_enabled():
     if not reg:
         return False
@@ -211,58 +379,62 @@ def is_autostart_enabled():
 def set_autostart(enable=True):
     if not reg:
         return
-    key = reg.OpenKey(reg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, reg.KEY_WRITE)
-    exe_path = os.path.abspath(sys.executable)
-    if enable:
-        reg.SetValueEx(key, "IDM-Agent", 0, reg.REG_SZ, exe_path)
-    else:
-        try:
-            reg.DeleteValue(key, "IDM-Agent")
-        except FileNotFoundError:
-            pass
-    reg.CloseKey(key)
+    try:
+        key = reg.OpenKey(reg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, reg.KEY_WRITE)
+        exe_path = os.path.abspath(sys.executable)
+        if enable:
+            reg.SetValueEx(key, "IDM-Agent", 0, reg.REG_SZ, exe_path)
+            show_custom_message("成功", "开机自启已启用", "success")
+        else:
+            try:
+                reg.DeleteValue(key, "IDM-Agent")
+                show_custom_message("成功", "开机自启已禁用", "success")
+            except FileNotFoundError:
+                pass
+        reg.CloseKey(key)
+        logger.info(f"开机自启状态已{'启用' if enable else '禁用'}")
+    except Exception as e:
+        logger.error(f"修改开机自启失败: {e}")
+        show_custom_message("错误", f"修改开机自启失败: {str(e)}", "error")
 
-# --- 显示密钥窗口 ---
+# --- 界面回调函数 ---
 def show_secret_key(icon, item):
-    root = tk.Tk()
-    root.title("🔐 安全密钥 - IDM Agent")
-    root.geometry("560x220")
-    root.resizable(False, False)
-    root.attributes("-topmost", True)
-
-    BG_COLOR = "#f8f9fa"
-    WARNING_COLOR = "#e74c3c"
-    KEY_BG = "#ffffff"
-    KEY_FG = "#000000"
-    BUTTON_BG = "#007bff"
-    BUTTON_HOVER = "#0056b3"
-    BUTTON_FG = "white"
-
-    root.configure(bg=BG_COLOR)
-
-    warning_frame = tk.Frame(root, bg=BG_COLOR)
-    warning_frame.pack(pady=(15, 5), padx=20, fill="x")
-
-    tk.Label(warning_frame, text="⚠️", font=("Arial", 16), fg=WARNING_COLOR, bg=BG_COLOR).pack(side=tk.LEFT)
+    """显示密钥窗口"""
+    root = create_custom_window("🔐 安全密钥 - IDM Agent", 580, 240)
+    
+    # 警告提示框
+    warning_frame = tk.Frame(root, bg=StyleConfig.LIGHT_COLOR)
+    warning_frame.pack(pady=(15, 10), padx=StyleConfig.WINDOW_PADDING, fill="x")
+    
+    tk.Label(
+        warning_frame,
+        text="⚠️",
+        font=("Arial", 16),
+        fg=StyleConfig.DANGER_COLOR,
+        bg=StyleConfig.LIGHT_COLOR
+    ).pack(side=tk.LEFT)
+    
     tk.Label(
         warning_frame,
         text="此密钥用于接口签名，请勿泄露给他人！",
-        font=("Microsoft YaHei", 10, "bold"),
-        fg=WARNING_COLOR,
-        bg=BG_COLOR,
+        font=StyleConfig.FONT_BOLD,
+        fg=StyleConfig.DANGER_COLOR,
+        bg=StyleConfig.LIGHT_COLOR,
         anchor="w"
     ).pack(side=tk.LEFT, padx=(8, 0))
-
-    key_frame = tk.Frame(root, bg=BG_COLOR)
-    key_frame.pack(pady=10, padx=20, fill="x")
-
+    
+    # 密钥显示框
+    key_frame = tk.Frame(root, bg=StyleConfig.LIGHT_COLOR)
+    key_frame.pack(pady=StyleConfig.ELEMENT_SPACING, padx=StyleConfig.WINDOW_PADDING, fill="x")
+    
+    # 带边框的文本框
     key_text = tk.Text(
         key_frame,
         height=2,
         width=60,
-        font=("Consolas", 10),
-        bg=KEY_BG,
-        fg=KEY_FG,
+        font=StyleConfig.FONT_MONO,
+        bg=StyleConfig.WHITE_COLOR,
+        fg=StyleConfig.DARK_COLOR,
         relief="solid",
         borderwidth=1,
         wrap="none"
@@ -270,162 +442,218 @@ def show_secret_key(icon, item):
     key_text.insert("1.0", config["secret_key"])
     key_text.config(state="disabled")
     key_text.pack(fill="x", padx=0, pady=0)
-
+    
+    # 按钮区域
+    btn_frame = tk.Frame(root, bg=StyleConfig.LIGHT_COLOR)
+    btn_frame.pack(pady=StyleConfig.ELEMENT_SPACING)
+    
+    # 复制按钮
     def copy_key():
         root.clipboard_clear()
         root.clipboard_append(config["secret_key"])
         root.update()
-        original = copy_btn.cget("text")
         copy_btn.config(text="✓ 已复制", state="disabled")
-        root.after(1500, lambda: copy_btn.config(text=original, state="normal"))
-
-    def close_window():
-        root.destroy()
-
-    btn_frame = tk.Frame(root, bg=BG_COLOR)
-    btn_frame.pack(pady=10)
-
-    copy_btn = tk.Button(
+        show_custom_message("成功", "密钥已复制到剪贴板", "success", root)
+        root.after(1500, lambda: copy_btn.config(text="📋 复制密钥", state="normal"))
+    
+    copy_btn = create_styled_button(
         btn_frame,
-        text="📋 复制密钥",
-        command=copy_key,
-        font=("Microsoft YaHei", 10, "bold"),
-        bg=BUTTON_BG,
-        fg=BUTTON_FG,
-        activebackground=BUTTON_HOVER,
-        relief="flat",
-        padx=20,
-        pady=5
+        "📋 复制密钥",
+        copy_key,
+        StyleConfig.PRIMARY_COLOR,
+        StyleConfig.WHITE_COLOR,
+        StyleConfig.HOVER_COLOR
     )
     copy_btn.pack(side=tk.LEFT, padx=10)
-
-    close_btn = tk.Button(
+    
+    # 关闭按钮
+    close_btn = create_styled_button(
         btn_frame,
-        text="✕ 关闭",
-        command=close_window,
-        font=("Microsoft YaHei", 10),
-        bg="#6c757d",
-        fg="white",
-        activebackground="#5a6268",
-        relief="flat",
-        padx=20,
-        pady=5
+        "✕ 关闭",
+        root.destroy,
+        StyleConfig.SECONDARY_COLOR,
+        StyleConfig.WHITE_COLOR,
+        "#5A6268"
     )
     close_btn.pack(side=tk.LEFT, padx=10)
-
-    root.protocol("WM_DELETE_WINDOW", close_window)
+    
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
     root.mainloop()
 
-# --- 设置 IDM 路径 ---
 def set_idm_path(icon, item):
-    root = tk.Tk()
-    root.title("📁 设置 IDM 路径")
-    root.geometry("600x160")
-    root.resizable(False, False)
-    root.attributes("-topmost", True)
-    root.configure(bg="#f8f9fa")
-
-    current_path = config.get("idm_path", "")
-
+    """设置IDM路径窗口"""
+    root = create_custom_window("📁 设置 IDM 路径", 620, 180)
+    
+    # 标签
     label = tk.Label(
         root,
-        text="请输入或选择 IDM 的主程序路径（IDMan.exe）：",
-        bg="#f8f9fa",
-        font=("Microsoft YaHei", 10)
+        text="请选择 IDM 主程序路径（IDMan.exe）：",
+        bg=StyleConfig.LIGHT_COLOR,
+        font=StyleConfig.FONT_MAIN
     )
-    label.pack(pady=(15, 5), padx=20, anchor="w")
-
+    label.pack(pady=(15, 5), padx=StyleConfig.WINDOW_PADDING, anchor="w")
+    
+    # 路径输入框
+    current_path = config.get("idm_path", "")
     path_var = tk.StringVar(value=current_path)
-    path_entry = tk.Entry(root, textvariable=path_var, width=70, font=("Consolas", 9))
-    path_entry.pack(pady=5, padx=20, fill="x")
-
+    
+    path_frame = tk.Frame(root, bg=StyleConfig.LIGHT_COLOR)
+    path_frame.pack(pady=5, padx=StyleConfig.WINDOW_PADDING, fill="x")
+    
+    path_entry = tk.Entry(
+        path_frame,
+        textvariable=path_var,
+        font=StyleConfig.FONT_MONO,
+        width=70,
+        relief="solid",
+        borderwidth=1
+    )
+    path_entry.pack(side=tk.LEFT, fill="x", expand=True)
+    
+    # 浏览按钮
     def browse_file():
         filepath = filedialog.askopenfilename(
             title="选择 IDMan.exe",
-            filetypes=[("Executable files", "IDMan.exe"), ("All files", "*.*")]
+            filetypes=[("IDM 程序", "IDMan.exe"), ("可执行文件", "*.exe"), ("所有文件", "*.*")],
+            initialdir=os.path.dirname(current_path) if current_path else "C:\\"
         )
         if filepath:
             path_var.set(filepath)
-
+    
+    browse_btn = create_styled_button(
+        path_frame,
+        "浏览...",
+        browse_file,
+        StyleConfig.SECONDARY_COLOR,
+        StyleConfig.WHITE_COLOR,
+        "#5A6268"
+    )
+    browse_btn.pack(side=tk.RIGHT, padx=(10, 0))
+    
+    # 按钮区域
+    btn_frame = tk.Frame(root, bg=StyleConfig.LIGHT_COLOR)
+    btn_frame.pack(pady=StyleConfig.ELEMENT_SPACING)
+    
+    # 保存按钮
     def save_path():
         new_path = path_var.get().strip()
         if not new_path:
-            messagebox.showwarning("警告", "路径不能为空！", parent=root)
+            show_custom_message("警告", "路径不能为空！", "warning", root)
             return
         if not new_path.endswith("IDMan.exe"):
-            messagebox.showwarning("警告", "路径应指向 IDMan.exe！", parent=root)
+            show_custom_message("警告", "路径应指向 IDMan.exe！", "warning", root)
             return
         if not os.path.isfile(new_path):
-            messagebox.showerror("错误", "该文件不存在！", parent=root)
+            show_custom_message("错误", "该文件不存在！", "error", root)
             return
-
+        
         config["idm_path"] = new_path
         save_config(config)
         logger.info(f"IDM 路径已更新为: {new_path}")
-        messagebox.showinfo("成功", "IDM 路径已更新！", parent=root)
+        show_custom_message("成功", "IDM 路径已更新！", "success", root)
         root.destroy()
-
-    btn_frame = tk.Frame(root, bg="#f8f9fa")
-    btn_frame.pack(pady=10)
-
-    tk.Button(btn_frame, text="浏览...", command=browse_file, width=10).pack(side=tk.LEFT, padx=5)
-    tk.Button(btn_frame, text="保存", command=save_path, width=10, bg="#28a745", fg="white").pack(side=tk.LEFT, padx=5)
-    tk.Button(btn_frame, text="取消", command=root.destroy, width=10).pack(side=tk.LEFT, padx=5)
-
+    
+    save_btn = create_styled_button(
+        btn_frame,
+        "✅ 保存",
+        save_path,
+        StyleConfig.PRIMARY_COLOR,
+        StyleConfig.WHITE_COLOR,
+        StyleConfig.HOVER_COLOR
+    )
+    save_btn.pack(side=tk.LEFT, padx=10)
+    
+    # 取消按钮
+    cancel_btn = create_styled_button(
+        btn_frame,
+        "✕ 取消",
+        root.destroy,
+        StyleConfig.SECONDARY_COLOR,
+        StyleConfig.WHITE_COLOR,
+        "#5A6268"
+    )
+    cancel_btn.pack(side=tk.LEFT, padx=10)
+    
     root.mainloop()
 
-# --- 托盘菜单回调函数（关键！）---
 def open_web_ui(icon, item):
+    """打开Web界面"""
     webbrowser.open("http://127.0.0.1:16880")
+    logger.info("已打开Web UI")
 
 def toggle_autostart(icon, item):
+    """切换开机自启"""
     current = is_autostart_enabled()
     set_autostart(not current)
-    status = "已启用" if not current else "已禁用"
-    logger.info(f"开机自启状态已{status}")
 
 def regenerate_secret_key(icon, item):
-    root = tk.Tk()
-    root.withdraw()
-    if messagebox.askyesno("确认", "重新生成密钥将使旧客户端失效，是否继续？"):
+    """重新生成密钥"""
+    result = show_custom_message(
+        "确认", 
+        "重新生成密钥将使旧客户端失效，是否继续？", 
+        "question"
+    )
+    
+    if result:
         new_key = secrets.token_urlsafe(32)
         config["secret_key"] = new_key
         save_config(config)
         logger.info("安全密钥已重新生成")
-        messagebox.showinfo("成功", "新密钥已生成并保存！")
-    root.destroy()
+        show_custom_message("成功", "新密钥已生成并保存！", "success")
 
 def quit_app(icon, item):
-    logger.info("程序正在退出...")
-    icon.stop()
-    os._exit(0)
+    """退出应用"""
+    if show_custom_message("确认", "确定要退出 IDM Agent 吗？", "question"):
+        logger.info("程序正在退出...")
+        icon.stop()
+        os._exit(0)
 
 # --- 主程序 ---
 def run_flask():
+    """运行Flask服务"""
     app.run(host='127.0.0.1', port=16880, debug=False, threaded=True)
 
 def main():
+    """主函数"""
+    # 启动Flask线程
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
-
+    logger.info("IDM Agent 已启动，监听端口 16880")
+    
+    # 创建托盘图标
     image = create_image()
+    
+    # 创建托盘菜单
     menu = (
-        pystray.MenuItem("打开 Web UI", open_web_ui),
+        pystray.MenuItem("🌐 打开 Web UI", open_web_ui),
         pystray.MenuItem(
-            "开机自动启动",
+            "🔄 开机自动启动",
             toggle_autostart,
             checked=lambda item: is_autostart_enabled()
         ),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("显示当前密钥", show_secret_key),
-        pystray.MenuItem("重新生成密钥", regenerate_secret_key),
-        pystray.MenuItem("设置 IDM 路径", set_idm_path),
+        pystray.MenuItem("🔑 显示当前密钥", show_secret_key),
+        pystray.MenuItem("🔄 重新生成密钥", regenerate_secret_key),
+        pystray.MenuItem("📁 设置 IDM 路径", set_idm_path),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("退出", quit_app)
+        pystray.MenuItem("🚪 退出", quit_app)
     )
+    
+    # 启动托盘
     icon = pystray.Icon("IDM-Agent", image, "IDM 下载代理", menu)
     icon.run()
-    
-# pyinstaller --onefile --windowed --name IDM-Agent main.py
+
+# --- 入口点 ---
 if __name__ == '__main__':
+    # 设置tkinter高清显示
+    try:
+        tk.CallWrapper().func = lambda *args: None  # 修复高DPI问题
+        if hasattr(tk, 'tk') and tk.tk.call('tk', 'scaling') < 1.0:
+            tk.tk.call('tk', 'scaling', 1.2)
+    except:
+        pass
+    
     main()
+
+# 打包
+# pyinstaller --onefile --windowed --name IDM-Agent --icon=icon.ico --add-data="icon.ico;." main.py

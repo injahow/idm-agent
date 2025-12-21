@@ -412,6 +412,7 @@ def _restart_flask_app():
 
 # 全局变量：用于保存主窗口实例
 _main_window = None
+_window_created = False  # 新增：标记窗口是否已创建
 
 def create_tray_icon():
     """创建系统托盘图标"""
@@ -439,21 +440,44 @@ def create_tray_icon():
         return image
     
     def show_main_window():
-        """显示主窗口（单例模式）"""
-        global _main_window
+        """显示主窗口（修复焦点问题）"""
+        global _main_window, _window_created
 
-        if _main_window is None:
+        def force_focus(window):
+            """强制获取焦点的辅助函数"""
+            window.deiconify()
+            window.lift()
+            window.focus_force()
+            window.attributes('-topmost', True)
+            window.update()
+            window.attributes('-topmost', False)
+            # 给第一个可聚焦的控件设置焦点
+            for widget in window.winfo_children():
+                if widget.winfo_children():
+                    for child in widget.winfo_children():
+                        try:
+                            child.focus_set()
+                            return
+                        except:
+                            continue
+                try:
+                    widget.focus_set()
+                    return
+                except:
+                    continue
+
+        if not _window_created:
             # 首次创建窗口
             root = tk.Tk()
             root.title("IDM Agent 配置")
-            root.geometry("700x600")
+            root.geometry("700x400")
             root.resizable(True, True)
 
             # 居中
             root.update_idletasks()
             x = (root.winfo_screenwidth() // 2) - (700 // 2)
-            y = (root.winfo_screenheight() // 2) - (600 // 2)
-            root.geometry(f"700x600+{x}+{y}")
+            y = (root.winfo_screenheight() // 2) - (400 // 2)
+            root.geometry(f"700x400+{x}+{y}")
 
             # 关闭窗口时隐藏而非销毁
             def on_closing():
@@ -734,16 +758,28 @@ def create_tray_icon():
             refresh_blacklist()
 
             _main_window = root  # 保存全局引用
+            _window_created = True  # 标记窗口已创建
+            
+            # 首次显示时强制获取焦点
+            force_focus(root)
+            
+            # 启动主循环
             root.mainloop()
 
         else:
-            # 已存在窗口：恢复显示并聚焦
-            _main_window.deiconify()      # 取消最小化
-            _main_window.lift()           # 提升到顶层
-            _main_window.focus_force()    # 强制获取焦点（关键！）
-            _main_window.attributes('-topmost', True)
-            _main_window.after(100, lambda: _main_window.attributes('-topmost', False))  # 短暂置顶后取消
-
+            # 已存在窗口：强制恢复显示并获取焦点
+            try:
+                # 检查窗口是否还存在（防止异常关闭）
+                _main_window.winfo_exists()
+                
+                # 强制恢复显示和焦点
+                force_focus(_main_window)
+                
+            except:
+                # 窗口已被销毁，重新创建
+                _window_created = False
+                show_main_window()
+    
     def quit_app(icon, item):
         """退出应用"""
         # 设置关闭事件

@@ -1,24 +1,26 @@
-# -*- coding: utf-8 -*-
+
 import os
 import sys
-import time
-import subprocess
-from urllib.parse import urlparse, unquote
-import webbrowser
 import json
+import time
 import hashlib
-import secrets
 import hmac
-from threading import Thread
-from flask import Flask, request, jsonify
-# --- 日志配置 ---
+import secrets
+import re
 import logging
-from logging.handlers import TimedRotatingFileHandler
-# --- GUI / 托盘依赖 ---
-import pystray
-from PIL import Image, ImageDraw
+import subprocess
+from datetime import datetime, timedelta
+from urllib.parse import unquote
+from pathlib import Path
+import threading
 import tkinter as tk
-from tkinter import messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
+import winreg
+from PIL import Image, ImageDraw
+from flask import Flask, request, jsonify, render_template_string
+import pystray
+from pystray import MenuItem as item
+from logging.handlers import TimedRotatingFileHandler
 
 # 获取程序所在目录
 if getattr(sys, 'frozen', False):
@@ -26,140 +28,88 @@ if getattr(sys, 'frozen', False):
 else:
     app_dir = os.path.dirname(os.path.abspath(__file__))
 
-# 日志目录
-log_dir = os.path.join(app_dir, "logs")
-os.makedirs(log_dir, exist_ok=True)
-log_path = os.path.join(log_dir, "idm_agent.log")
+# 配置文件路径
+CONFIG_FILE = os.path.join(app_dir, "config.json")
+BLACKLIST_FILE = os.path.join(app_dir, "blacklist.json")
 
-# --- 日志配置 ---
-logger = logging.getLogger("IDM-Agent")
-logger.setLevel(logging.INFO)
+# 默认配置
+DEFAULT_CONFIG = {
+    "secret_key": "",
+    "idm_path": r"C:\Program Files (x86)\Internet Download Manager\IDMan.exe",
+    "listen_local_only": True,
+    "auto_start": False,
+    "idm_auto_download": True,
+    "max_failures": 5,
+    "ban_duration": 3600,
+    "time_window": 60
+}
 
-if not logger.handlers:
+# 日志配置
+def setup_logger():
+    log_dir = Path(app_dir) / "logs"
+    log_dir.mkdir(exist_ok=True)
+    
+    logger = logging.getLogger("IDMAgent")
+    logger.setLevel(logging.INFO)
+    
+    # 按天轮转的文件处理器
     file_handler = TimedRotatingFileHandler(
-        log_path,
+        log_dir / "agent.log",
         when="midnight",
         interval=1,
         backupCount=7,
         encoding="utf-8"
     )
-    file_handler.suffix = "%Y-%m-%d"
-    file_formatter = logging.Formatter(
-        fmt='%(asctime)s [%(levelname)s] %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+    file_handler.setFormatter(
+        logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     )
-    file_handler.setFormatter(file_formatter)
-    logger.addHandler(file_handler)
     
-    # 控制台日志
+    # 控制台处理器
     console_handler = logging.StreamHandler()
-    console_formatter = logging.Formatter('[%(levelname)s] %(message)s')
-    console_handler.setFormatter(console_formatter)
+    console_handler.setFormatter(
+        logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    )
+    
+    logger.addHandler(file_handler)
     logger.addHandler(console_handler)
-
-# --- Windows 注册表（开机启动）---
-try:
-    import winreg as reg
-except ImportError:
-    reg = None
-
-# --- 全局样式配置 ---
-class StyleConfig:
-    # 颜色方案
-    PRIMARY_COLOR = "#4A6CF7"      # 主色调（蓝色）
-    SECONDARY_COLOR = "#6C757D"    # 次要颜色（灰色）
-    SUCCESS_COLOR = "#28A745"      # 成功色（绿色）
-    DANGER_COLOR = "#DC3545"       # 危险色（红色）
-    WARNING_COLOR = "#FFC107"      # 警告色（黄色）
-    LIGHT_COLOR = "#F8F9FA"        # 浅色背景
-    DARK_COLOR = "#343A40"         # 深色文字
-    WHITE_COLOR = "#FFFFFF"        # 白色
-    HOVER_COLOR = "#3A5CE7"        # 悬停色
     
-    # 字体配置
-    FONT_MAIN = ("Microsoft YaHei", 10)
-    FONT_BOLD = ("Microsoft YaHei", 10, "bold")
-    FONT_SMALL = ("Microsoft YaHei", 9)
-    FONT_MONO = ("Consolas", 10)
+    return logger
+
+logger = setup_logger()
+
+class ConfigManager:
+    def __init__(self):
+        self.config = DEFAULT_CONFIG.copy()
+        self.load_config()
     
-    # 尺寸配置
-    WINDOW_PADDING = 20
-    ELEMENT_SPACING = 10
-    BUTTON_PADDING = (20, 6)
-    BORDER_RADIUS = 6
-    SHADOW_EFFECT = 2
-
-# --- 配置 ---
-TIME_WINDOW_MS = 60 * 1000  # 60秒，单位：毫秒
-CONFIG_FILE = os.path.join(app_dir, "idm_agent_config.json")
-DEFAULT_CONFIG = {
-    "secret_key": lambda: secrets.token_urlsafe(32),
-    "idm_path": r"C:\Program Files (x86)\Internet Download Manager\IDMan.exe",
-    "idm_auto_download": False
-}
-
-def load_config():
-    """智能加载配置：差量合并，默认值填充"""
-    config = {}
-    if os.path.exists(CONFIG_FILE):
+    def load_config(self):
+        """加载配置文件"""
         try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                file_config = json.load(f)
-                if isinstance(file_config, dict):
-                    config.update(file_config)
-                else:
-                    logger.warning("配置文件格式错误，使用默认配置")
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    saved_config = json.load(f)
+                    self.config.update(saved_config)
         except Exception as e:
-            logger.warning(f"配置加载失败: {e}")
-    for key, default_value in DEFAULT_CONFIG.items():
-        if key not in config:
-            config[key] = default_value() if callable(default_value) else default_value
-    if not os.path.exists(CONFIG_FILE) or _config_needs_update(config):
-        save_config(config)
+            logger.error(f"加载配置失败: {e}")
     
-    return config
+    def save_config(self):
+        """保存配置文件"""
+        try:
+            # 保存完整配置包括密钥
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.config, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存配置失败: {e}")
+    
+    def get_secret_key(self):
+        """获取密钥"""
+        return self.config.get('secret_key', '')
 
-def _config_needs_update(current_config):
-    """检查配置是否需要更新"""
-    try:
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            saved_config = json.load(f)
-        return any(
-            key not in saved_config or saved_config[key] != current_config[key]
-            for key in current_config.keys()
-        )
-    except:
-        return True
+config_manager = ConfigManager()
 
-def save_config(config):
-    """保存配置"""
-    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-    safe_config = {}
-    safe_config.update(config)
-    for key, default_value in DEFAULT_CONFIG.items():
-        if key not in safe_config:
-            safe_config[key] = default_value() if callable(default_value) else default_value
-    try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(safe_config, f, indent=4, ensure_ascii=False)
-    except Exception as e:
-        logger.error(f"配置保存失败: {e}")
-
-config = load_config()
-
-# --- Flask App ---
-app = Flask(__name__)
-
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
-    return response
-
-@app.route('/download', methods=['OPTIONS'])
-def handle_options():
-    return '', 200
+def generate_secret_key():
+    """生成随机密钥"""
+    return secrets.token_hex(32)
 
 def generate_md5_signature(params, secret):
     items = [(k, v) for k, v in params.items() if k != 'sign' and v is not None]
@@ -168,6 +118,14 @@ def generate_md5_signature(params, secret):
     return hashlib.md5(raw.encode('utf-8')).hexdigest()
 
 def verify_md5_signature(params, signature):
+    """验证MD5签名"""
+    secret_key = config_manager.get_secret_key()
+    if not secret_key:
+        logger.warning("未设置密钥，无法验证签名")
+        return False
+    
+    # 验证时间戳
+    time_window = config_manager.config['time_window'] * 1000
     try:
         ts = int(params.get('ts', 0))
     except (ValueError, TypeError):
@@ -175,565 +133,611 @@ def verify_md5_signature(params, signature):
         return False
     
     now_ms = int(time.time() * 1000)
-    if abs(now_ms - ts) > TIME_WINDOW_MS:
+    if abs(now_ms - ts) > time_window:
         logger.warning("签名已过期")
         return False
     
-    current_secret = config["secret_key"]
-    expected_sig = generate_md5_signature(params, current_secret)
+    expected_sig = generate_md5_signature(params, secret_key)
     return hmac.compare_digest(expected_sig, signature)
 
 def is_url(url):
+    """简单验证URL格式"""
+
+    pattern = re.compile(
+        r'^https?://'  # http:// or https://
+        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?|'  # domain...
+        r'localhost|'  # localhost...
+        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # ...or ip
+        r'(?::\d+)?'  # optional port
+        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+    return url is not None and pattern.search(url) is not None
+
+def sanitize_filename(filename):
+    """清理文件名"""
+    invalid_chars = '<>:"/\\|?*'
+    for char in invalid_chars:
+        filename = filename.replace(char, '_')
+    return filename.strip()
+
+def load_blacklist():
+    """加载黑名单"""
     try:
-        urlparse(url)
-        return True
+        if os.path.exists(BLACKLIST_FILE):
+            with open(BLACKLIST_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
     except Exception as e:
-        logger.warning(f"无效的 URL: {url}, err: {e}", exc_info=True)
-        return False
+        logger.error(f"加载黑名单失败: {e}")
+    return {}
 
-def truncate_filename_with_ext(name, max_length=255):
-    """
-    截断文件名至 max_length
-    """
-    if not isinstance(name, str) or not name:
-        return ""
-    if '.' in name and not name.startswith('.'):
-        parts = name.rsplit('.', 1)
-        basename, ext = parts[0], parts[1]
-    else:
-        basename, ext = name, ""
-    if not ext:
-        return basename[:max_length]
-    max_basename_len = max_length - len(ext) - 1
-    if max_basename_len <= 0:
-        return ext[:max_length]
-    truncated_basename = basename[:max_basename_len]
-    result = f"{truncated_basename}.{ext}"
-    return result
-
-def sanitize_filename(name):
-    bad_chars = '<>:"/\\|?*'
-    for c in bad_chars:
-        name = name.replace(c, '')
-    name = name.lstrip('.')
-    return truncate_filename_with_ext(name)
-
-@app.route('/download', methods=['GET', 'POST'])
-def add_download():
-    if request.method == 'POST':
-        data = request.get_json() if request.is_json else request.form
-        params = {
-            "url": data.get('url'),
-            "filename": data.get('filename'),
-            "ts": data.get('ts')
-        }
-        signature = data.get('sign')
-    else:
-        params = {
-            "url": request.args.get('url'),
-            "filename": request.args.get('filename'),
-            "ts": request.args.get('ts')
-        }
-        signature = request.args.get('sign')
-
-    if not all([params['url'], params['ts'], signature]):
-        logger.warning("缺少必要参数: url, ts 或 sign")
-        return jsonify({"error": "Missing required fields: url, ts, sign"}), 400
-
-    if not verify_md5_signature(params, signature):
-        logger.warning("签名验证失败或已过期")
-        return jsonify({"error": "Invalid or expired signature"}), 403
-
+def save_blacklist(blacklist):
+    """保存黑名单"""
     try:
-        idm_exe = config["idm_path"]
-        if not os.path.isfile(idm_exe):
-            logger.error(f"IDM 未找到: {idm_exe}")
-            return jsonify({"error": f"IDM 未找到: {idm_exe}"}), 500
-
-        if not params['url'] or not is_url(params['url']):
-            return jsonify({"error": "Invalid URL"}), 400
-        
-        url = unquote(params['url'])
-        logger.info(f"合法请求: {url}")
-
-        cmd = [idm_exe, "/d", url]
-        if params['filename']:
-            filename = unquote(params['filename'])
-            filename = sanitize_filename(params['filename'])
-            if filename:
-                cmd.extend(["/f", filename])
-
-        if config["idm_auto_download"]:
-            cmd.append("/n")
-
-        subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
-        return jsonify({"code": 0, "message": "Download sent to IDM"}), 200
+        with open(BLACKLIST_FILE, 'w', encoding='utf-8') as f:
+            json.dump(blacklist, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.error(f"执行下载时发生异常: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"保存黑名单失败: {e}")
 
-@app.route('/')
-def index():
-    return """
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-    <head>
-        <meta charset="UTF-8">
-        <title>IDM Agent 运行中</title>
-        <style>
-            body { font-family: 'Microsoft YaHei', sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
-            .container { background: #f8f9fa; border-radius: 10px; padding: 30px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-            h2 { color: #4A6CF7; margin-bottom: 20px; }
-            code { background: #e9ecef; padding: 2px 6px; border-radius: 4px; color: #DC3545; }
-            .param-box { background: white; padding: 15px; border-radius: 6px; margin: 15px 0; border-left: 4px solid #4A6CF7; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h2>IDM Agent 正在运行</h2>
-            <p>接口地址: <code>http://127.0.0.1:16880/download</code></p>
-            <div class="param-box">
-                <p>必填参数:</p>
-                <ul>
-                    <li><code>url</code>: 下载链接</li>
-                    <li><code>ts</code>: 毫秒时间戳</li>
-                    <li><code>sign</code>: 签名值</li>
-                </ul>
-                <p>可选参数:</p>
-                <ul>
-                    <li><code>filename</code>: 文件名</li>
-                </ul>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-
-# --- 工具函数 ---
-def create_image():
-    """创建托盘图标"""
-    ICON_SIZE = (32, 32)
-    BG_COLOR = (255, 255, 255)
-    CROSS_COLOR = (74, 108, 247)  # 使用主色调
-    LINE_WIDTH = 4
-    PADDING = 2
-    
-    image = Image.new("RGB", ICON_SIZE, BG_COLOR)
-    draw = ImageDraw.Draw(image)
-    center_x = ICON_SIZE[0] / 2 - 0.5
-    center_y = ICON_SIZE[1] / 2 - 0.5
-    
-    # 绘制十字线
-    horizontal_start = (PADDING, center_y)
-    horizontal_end = (ICON_SIZE[0] - PADDING, center_y)
-    vertical_start = (center_x, PADDING)
-    vertical_end = (center_x, ICON_SIZE[1] - PADDING)
-    
-    draw.line([horizontal_start, horizontal_end], fill=CROSS_COLOR, width=LINE_WIDTH, joint="round")
-    draw.line([vertical_start, vertical_end], fill=CROSS_COLOR, width=LINE_WIDTH, joint="round")
-    
-    return image
-
-def create_custom_window(title, width, height):
-    """创建统一样式的窗口"""
-    root = tk.Tk()
-    root.title(title)
-    root.geometry(f"{width}x{height}")
-    root.resizable(False, False)
-    root.configure(bg=StyleConfig.LIGHT_COLOR)
-    
-    # 设置窗口图标（如果有）
-    try:
-        root.iconphoto(False, tk.PhotoImage(data=create_image().tobytes()))
-    except:
-        pass
-    
-    # 居中显示
-    root.withdraw()
-    root.update_idletasks()
-    screen_width = root.winfo_screenwidth()
-    screen_height = root.winfo_screenheight()
-    x = (screen_width - width) // 2
-    y = (screen_height - height) // 2
-    root.geometry(f"{width}x{height}+{x}+{y}")
-    root.deiconify()
-    
-    return root
-
-def create_styled_button(parent, text, command, bg_color=StyleConfig.PRIMARY_COLOR, 
-                        fg_color=StyleConfig.WHITE_COLOR, hover_color=StyleConfig.HOVER_COLOR):
-    """创建样式统一的按钮"""
-    btn = tk.Button(
-        parent,
-        text=text,
-        command=command,
-        font=StyleConfig.FONT_MAIN,
-        bg=bg_color,
-        fg=fg_color,
-        relief="flat",
-        padx=StyleConfig.BUTTON_PADDING[0],
-        pady=StyleConfig.BUTTON_PADDING[1],
-        cursor="hand2"
-    )
-    
-    # 添加悬停效果
-    def on_enter(e):
-        btn.config(bg=hover_color)
-    
-    def on_leave(e):
-        btn.config(bg=bg_color)
-    
-    btn.bind("<Enter>", on_enter)
-    btn.bind("<Leave>", on_leave)
-    
-    # 圆角效果（模拟）
-    try:
-        btn.config(bd=0, highlightthickness=0)
-    except:
-        pass
-    
-    return btn
-
-def show_custom_message(title, message, msg_type="info", parent=None):
-    """统一的消息提示框"""
-    if msg_type == "info":
-        bg = StyleConfig.PRIMARY_COLOR
-    elif msg_type == "warning":
-        bg = StyleConfig.WARNING_COLOR
-    elif msg_type == "error":
-        bg = StyleConfig.DANGER_COLOR
-    elif msg_type == "success":
-        bg = StyleConfig.SUCCESS_COLOR
-    else:
-        bg = StyleConfig.PRIMARY_COLOR
-    
-    # 创建临时窗口用于样式
-    temp_root = tk.Toplevel(parent) if parent else tk.Tk()
-    temp_root.withdraw()
-    temp_root.configure(bg=bg)
-    
-    # 显示消息框
-    if msg_type == "success":
-        result = messagebox.showinfo(title, message, parent=temp_root)
-    elif msg_type == "warning":
-        result = messagebox.showwarning(title, message, parent=temp_root)
-    elif msg_type == "error":
-        result = messagebox.showerror(title, message, parent=temp_root)
-    elif msg_type == "question":
-        result = messagebox.askyesno(title, message, parent=temp_root)
-    else:
-        result = messagebox.showinfo(title, message, parent=temp_root)
-    
-    temp_root.destroy()
-    return result
-
-# --- 注册表相关 ---
-def is_autostart_enabled():
-    if not reg:
-        return False
-    try:
-        key = reg.OpenKey(reg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, reg.KEY_READ)
-        value, _ = reg.QueryValueEx(key, "IDM-Agent")
-        reg.CloseKey(key)
-        return os.path.abspath(sys.executable) in value
-    except FileNotFoundError:
-        return False
-
-def set_autostart(enable=True):
-    if not reg:
-        show_custom_message("错误", "无法修改开机自启状态", "error")
-        return
-    try:
-        key = reg.OpenKey(reg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, reg.KEY_WRITE)
-        exe_path = os.path.abspath(sys.executable)
-        if enable:
-            reg.SetValueEx(key, "IDM-Agent", 0, reg.REG_SZ, exe_path)
+def is_ip_blacklisted(ip):
+    """检查IP是否在黑名单中"""
+    blacklist = load_blacklist()
+    if ip in blacklist:
+        ban_info = blacklist[ip]
+        ban_time = datetime.fromisoformat(ban_info['timestamp'])
+        duration = timedelta(seconds=ban_info['duration'])
+        if datetime.now() - ban_time < duration:
+            return True
         else:
-            try:
-                reg.DeleteValue(key, "IDM-Agent")
-            except FileNotFoundError:
-                pass
-        reg.CloseKey(key)
-        logger.info(f"开机自启状态已{'启用' if enable else '禁用'}")
-    except Exception as e:
-        logger.error(f"修改开机自启失败: {e}")
-        show_custom_message("错误", f"修改开机自启失败: {str(e)}", "error")
+            # 清除过期的封禁
+            del blacklist[ip]
+            save_blacklist(blacklist)
+    return False
 
-def is_idm_auto_download():
-    return config["idm_auto_download"]
-    
-def set_idm_auto_download(enable=True):
-    config["idm_auto_download"] = enable
-    save_config(config)
-    logger.info(f"IDM自动下载已{'启用' if enable else '禁用'}")
+def add_to_blacklist(ip, reason=""):
+    """添加IP到黑名单"""
+    blacklist = load_blacklist()
+    blacklist[ip] = {
+        'timestamp': datetime.now().isoformat(),
+        'duration': config_manager.config['ban_duration'],
+        'reason': reason
+    }
+    save_blacklist(blacklist)
+    logger.info(f"IP {ip} 已加入黑名单，原因: {reason}")
 
-# --- 界面回调函数 ---
-def show_secret_key(icon, item):
-    """显示密钥窗口"""
-    root = create_custom_window("安全密钥 - IDM Agent", 580, 240)
-    
-    # 警告提示框
-    warning_frame = tk.Frame(root, bg=StyleConfig.LIGHT_COLOR)
-    warning_frame.pack(pady=(15, 10), padx=StyleConfig.WINDOW_PADDING, fill="x")
-    
-    tk.Label(
-        warning_frame,
-        text="⚠️",
-        font=("Arial", 16),
-        fg=StyleConfig.DANGER_COLOR,
-        bg=StyleConfig.LIGHT_COLOR
-    ).pack(side=tk.LEFT)
-    
-    tk.Label(
-        warning_frame,
-        text="此密钥用于接口签名，请勿泄露给他人！",
-        font=StyleConfig.FONT_BOLD,
-        fg=StyleConfig.DANGER_COLOR,
-        bg=StyleConfig.LIGHT_COLOR,
-        anchor="w"
-    ).pack(side=tk.LEFT, padx=(8, 0))
-    
-    # 密钥显示框
-    key_frame = tk.Frame(root, bg=StyleConfig.LIGHT_COLOR)
-    key_frame.pack(pady=StyleConfig.ELEMENT_SPACING, padx=StyleConfig.WINDOW_PADDING, fill="x")
-    
-    # 带边框的文本框
-    key_text = tk.Text(
-        key_frame,
-        height=2,
-        width=60,
-        font=StyleConfig.FONT_MONO,
-        bg=StyleConfig.WHITE_COLOR,
-        fg=StyleConfig.DARK_COLOR,
-        relief="solid",
-        borderwidth=1,
-        wrap="none"
-    )
-    key_text.insert("1.0", config["secret_key"])
-    key_text.config(state="disabled")
-    key_text.pack(fill="x", padx=0, pady=0)
-    
-    # 按钮区域
-    btn_frame = tk.Frame(root, bg=StyleConfig.LIGHT_COLOR)
-    btn_frame.pack(pady=StyleConfig.ELEMENT_SPACING)
-    
-    # 复制按钮
-    def copy_key():
-        root.clipboard_clear()
-        root.clipboard_append(config["secret_key"])
-        root.update()
-        show_custom_message("成功", "密钥已复制到剪贴板", "success", root)
+# 全局变量用于控制Flask应用
+flask_app_instance = None
+flask_thread = None
+shutdown_event = threading.Event()
 
-    copy_btn = create_styled_button(
-        btn_frame,
-        "复制密钥",
-        copy_key,
-        StyleConfig.PRIMARY_COLOR,
-        StyleConfig.WHITE_COLOR,
-        StyleConfig.HOVER_COLOR
-    )
-    copy_btn.pack(side=tk.LEFT, padx=10)
+def run_flask_app():
+    """运行Flask应用"""
+    global flask_app_instance
+    failure_counts = {}
     
-    # 关闭按钮
-    close_btn = create_styled_button(
-        btn_frame,
-        "关闭",
-        root.destroy,
-        StyleConfig.PRIMARY_COLOR,
-        StyleConfig.WHITE_COLOR,
-        StyleConfig.HOVER_COLOR
-    )
-    close_btn.pack(side=tk.LEFT, padx=10)
+    app = Flask(__name__)
+    flask_app_instance = app  # 保存实例以便重启时使用
     
-    root.protocol("WM_DELETE_WINDOW", root.destroy)
-    root.mainloop()
+    @app.after_request
+    def after_request(response):
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        return response
 
-def set_idm_path(icon, item):
-    """设置IDM路径窗口"""
-    root = create_custom_window("设置 IDM 路径", 620, 180)
+    @app.route('/download', methods=['OPTIONS'])
+    def handle_options():
+        return '', 200
     
-    # 标签
-    label = tk.Label(
-        root,
-        text="请选择 IDM 主程序路径（IDMan.exe）：",
-        bg=StyleConfig.LIGHT_COLOR,
-        font=StyleConfig.FONT_MAIN
-    )
-    label.pack(pady=(15, 5), padx=StyleConfig.WINDOW_PADDING, anchor="w")
-    
-    # 路径输入框
-    current_path = config.get("idm_path", "")
-    path_var = tk.StringVar(value=current_path)
-    
-    path_frame = tk.Frame(root, bg=StyleConfig.LIGHT_COLOR)
-    path_frame.pack(pady=5, padx=StyleConfig.WINDOW_PADDING, fill="x")
-    
-    path_entry = tk.Entry(
-        path_frame,
-        textvariable=path_var,
-        font=StyleConfig.FONT_MONO,
-        width=70,
-        relief="solid",
-        borderwidth=1
-    )
-    path_entry.pack(side=tk.LEFT, fill="x", expand=True)
-    
-    # 浏览按钮
-    def browse_file():
-        filepath = filedialog.askopenfilename(
-            title="选择 IDMan.exe",
-            filetypes=[("IDM 程序", "IDMan.exe"), ("可执行文件", "*.exe"), ("所有文件", "*.*")],
-            initialdir=os.path.dirname(current_path) if current_path else "C:\\"
-        )
-        if filepath:
-            path_var.set(filepath)
-    
-    browse_btn = create_styled_button(
-        path_frame,
-        "浏览...",
-        browse_file,
-        StyleConfig.PRIMARY_COLOR,
-        StyleConfig.WHITE_COLOR,
-        StyleConfig.HOVER_COLOR
-    )
-    browse_btn.pack(side=tk.RIGHT, padx=(10, 0))
-    
-    # 按钮区域
-    btn_frame = tk.Frame(root, bg=StyleConfig.LIGHT_COLOR)
-    btn_frame.pack(pady=StyleConfig.ELEMENT_SPACING)
-    
-    # 保存按钮
-    def save_path():
-        new_path = path_var.get().strip()
-        if not new_path:
-            show_custom_message("警告", "路径不能为空！", "warning", root)
-            return
-        if not new_path.endswith("IDMan.exe"):
-            show_custom_message("警告", "路径应指向 IDMan.exe！", "warning", root)
-            return
-        if not os.path.isfile(new_path):
-            show_custom_message("错误", "该文件不存在！", "error", root)
-            return
+    @app.route('/download', methods=['GET', 'POST'])
+    def add_download():
+        """核心下载接口（完全重构，无阻塞）"""
+        client_ip = request.remote_addr
         
-        config["idm_path"] = new_path
-        save_config(config)
-        logger.info(f"IDM 路径已更新为: {new_path}")
-        show_custom_message("成功", "IDM 路径已更新！", "success", root)
-        root.destroy()
+        try:
+            # 检查IP是否在黑名单中
+            if is_ip_blacklisted(client_ip):
+                logger.warning(f"黑名单IP {client_ip} 尝试访问")
+                return jsonify({"code": 400, "message": "Forbidden - IP blocked"}), 200
+            
+            # 2. 解析参数（容错处理）
+            params = {
+                "url": "",
+                "filename": "",
+                "ts": ""
+            }
+            signature = ""
+            
+            try:
+                if request.method == 'POST':
+                    if request.is_json:
+                        data = request.get_json(silent=True) or {}
+                    else:
+                        data = request.form.to_dict()
+                    params["url"] = data.get('url', '').strip()
+                    params["filename"] = data.get('filename', '').strip()
+                    params["ts"] = data.get('ts', '').strip()
+                    signature = data.get('sign', '').strip()
+                else:
+                    params["url"] = request.args.get('url', '').strip()
+                    params["filename"] = request.args.get('filename', '').strip()
+                    params["ts"] = request.args.get('ts', '').strip()
+                    signature = request.args.get('sign', '').strip()
+            except Exception as e:
+                logger.error(f"解析参数失败: {e}")
+                # 记录失败次数
+                failure_counts[client_ip] = failure_counts.get(client_ip, 0) + 1
+                if failure_counts[client_ip] >= config_manager.config['max_failures']:
+                    add_to_blacklist(client_ip, "参数解析失败")
+                    del failure_counts[client_ip]  # 清除计数
+                return jsonify({"code": 400, "message": "Parameter parsing failed"}), 200
+            
+            # 3. 检查必填参数（极简版）
+            if not all([params['url'], params['ts'], signature]):
+                logger.warning(f"客户端 {client_ip} 缺少必要参数: url={bool(params['url'])}, ts={bool(params['ts'])}, sign={bool(signature)}")
+                # 记录失败次数
+                failure_counts[client_ip] = failure_counts.get(client_ip, 0) + 1
+                if failure_counts[client_ip] >= config_manager.config['max_failures']:
+                    add_to_blacklist(client_ip, "缺少必要参数")
+                    del failure_counts[client_ip]  # 清除计数
+                return jsonify({"code": 400, "message": "Missing required fields: url, ts, sign"}), 200
+            
+            # 4. 验证签名
+            if not verify_md5_signature(params, signature):
+                logger.warning(f"客户端 {client_ip} 签名验证失败")
+                # 记录失败次数
+                failure_counts[client_ip] = failure_counts.get(client_ip, 0) + 1
+                if failure_counts[client_ip] >= config_manager.config['max_failures']:
+                    add_to_blacklist(client_ip, "签名验证失败")
+                    del failure_counts[client_ip]  # 清除计数
+                return jsonify({"code": 400, "message": "Invalid or expired signature"}), 200
+            
+            # 5. 检查URL有效性
+            if not is_url(params['url']):
+                logger.warning(f"客户端 {client_ip} 无效URL: {params['url']}")
+                # 记录失败次数
+                failure_counts[client_ip] = failure_counts.get(client_ip, 0) + 1
+                if failure_counts[client_ip] >= config_manager.config['max_failures']:
+                    add_to_blacklist(client_ip, "无效URL")
+                    del failure_counts[client_ip]  # 清除计数
+                return jsonify({"code": 400, "message": "Invalid URL"}), 200
+            
+            # 如果验证通过，清除失败计数
+            if client_ip in failure_counts:
+                del failure_counts[client_ip]
+            
+            # 6. 执行IDM下载
+            try:
+                idm_exe = config_manager.config["idm_path"]
+                if not os.path.isfile(idm_exe):
+                    logger.error(f"IDM 未找到: {idm_exe}")
+                    return jsonify({"code": 400, "message": f"IDM not found: {idm_exe}"}), 200
+                
+                url = unquote(params['url'])
+                logger.info(f"合法请求来自 {client_ip}: {url}")
+                
+                # 构建命令
+                cmd = [idm_exe, "/d", url]
+                if params['filename']:
+                    filename = unquote(params['filename'])
+                    filename = sanitize_filename(filename)
+                    if filename:
+                        cmd.extend(["/f", filename])
+                
+                if config_manager.config["idm_auto_download"]:
+                    cmd.append("/n")
+                
+                # 执行命令（无阻塞）
+                subprocess.Popen(
+                    cmd,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                
+                return jsonify({"code": 0, "message": "Download sent to IDM"}), 200
+            
+            except Exception as e:
+                logger.error(f"执行下载失败: {e}", exc_info=True)
+                return jsonify({"code": 400, "message": f"Download failed: {str(e)}"}), 200
+        except Exception as e:
+            logger.error(f"捕获异常: {e}", exc_info=True)
+            return jsonify({"code": 400, "message": "Internal server error"}), 200
+
+    @app.route('/')
+    def index():
+        """WebUI首页"""
+        client_ip = request.remote_addr
+        if is_ip_blacklisted(client_ip):
+            return "Forbidden - IP blocked", 200
+            
+        return """
+        <!DOCTYPE html>
+        <html lang="zh-CN">
+        <head>
+            <meta charset="UTF-8">
+            <title>IDM Agent 运行中</title>
+            <style>
+                body { font-family: 'Microsoft YaHei', sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
+                .container { background: #f8f9fa; border-radius: 10px; padding: 30px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                h2 { color: #4A6CF7; margin-bottom: 20px; }
+                code { background: #e9ecef; padding: 2px 6px; border-radius: 4px; color: #DC3545; }
+                .param-box { background: white; padding: 15px; border-radius: 6px; margin: 15px 0; border-left: 4px solid #4A6CF7; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h2>IDM Agent 正在运行</h2>
+                <p>接口地址: <code>http://127.0.0.1:16880/download</code></p>
+                <div class="param-box">
+                    <p>必填参数:</p>
+                    <ul>
+                        <li><code>url</code>: 下载链接</li>
+                        <li><code>ts</code>: 毫秒时间戳</li>
+                        <li><code>sign</code>: 签名值</li>
+                    </ul>
+                    <p>可选参数:</p>
+                    <ul>
+                        <li><code>filename</code>: 文件名</li>
+                    </ul>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
     
-    save_btn = create_styled_button(
-        btn_frame,
-        "保存",
-        save_path,
-        StyleConfig.PRIMARY_COLOR,
-        StyleConfig.WHITE_COLOR,
-        StyleConfig.HOVER_COLOR
-    )
-    save_btn.pack(side=tk.LEFT, padx=10)
+    host = '127.0.0.1' if config_manager.config['listen_local_only'] else '0.0.0.0'
+    app.run(host=host, port=16880, debug=False, threaded=True, use_reloader=False)
+
+def restart_flask_app():
+    """重启Flask应用以应用新配置"""
+    global flask_thread, shutdown_event
     
-    # 取消按钮
-    cancel_btn = create_styled_button(
-        btn_frame,
-        "✕ 取消",
-        root.destroy,
-        StyleConfig.PRIMARY_COLOR,
-        StyleConfig.WHITE_COLOR,
-        StyleConfig.HOVER_COLOR
-    )
-    cancel_btn.pack(side=tk.LEFT, padx=10)
+    # 设置关闭事件，让当前线程结束
+    if shutdown_event:
+        shutdown_event.set()
     
-    root.mainloop()
-
-def open_web_ui(icon, item):
-    """打开Web界面"""
-    webbrowser.open("http://127.0.0.1:16880")
-    logger.info("已打开Web UI")
-
-def toggle_autostart(icon, item):
-    """切换开机自启"""
-    current = is_autostart_enabled()
-    set_autostart(not current)
-
-def toggle_idm_auto_download(icon, item):
-    """切换idm自动下载"""
-    current = is_idm_auto_download()
-    set_idm_auto_download(not current)
-
-def regenerate_secret_key(icon, item):
-    """重新生成密钥"""
-    result = show_custom_message(
-        "确认", 
-        "重新生成密钥将使旧客户端失效，是否继续？", 
-        "question"
-    )
+    # 等待当前线程结束
+    if flask_thread and flask_thread.is_alive():
+        flask_thread.join(timeout=5)  # 最多等待5秒
     
-    if result:
-        new_key = secrets.token_urlsafe(32)
-        config["secret_key"] = new_key
-        save_config(config)
-        logger.info("安全密钥已重新生成")
-        show_custom_message("成功", "新密钥已生成并保存！", "success")
-
-def quit_app(icon, item):
-    """退出应用"""
-    result = show_custom_message("确认", "确定要退出 IDM Agent 吗？", "question")
-    if result:
-        logger.info("程序正在退出...")
-        icon.stop()
-        os._exit(0)
-
-# --- 主程序 ---
-def run_flask():
-    """运行Flask服务"""
-    # 本地测试环境
-    app.run(host='127.0.0.1', port=16880, debug=False, threaded=True)
-
-def main():
-    """主函数"""
-    # 启动Flask线程
-    flask_thread = Thread(target=run_flask, daemon=True)
+    # 重置关闭事件
+    shutdown_event.clear()
+    
+    # 启动新的Flask应用线程
+    flask_thread = threading.Thread(target=run_flask_app, daemon=True)
     flask_thread.start()
-    logger.info("IDM Agent 已启动，监听端口 16880")
+    logger.info("Web服务已重启")
+
+# 全局变量：用于保存主窗口实例
+_main_window = None
+
+def create_tray_icon():
+    """创建系统托盘图标"""
+    def create_image():
+        # 创建一个简单的图标
+        width = 64
+        height = 64
+        image = Image.new('RGB', (width, height), color=(41, 128, 185))
+        draw = ImageDraw.Draw(image)
+        
+        # 绘制简单的IDM标志
+        draw.rectangle([10, 10, 54, 54], outline=(255, 255, 255), width=3)
+        draw.text((20, 25), "IDM", fill=(255, 255, 255))
+        
+        return image
+    
+    def show_main_window():
+        """显示主窗口（单例模式）"""
+        global _main_window
+
+        if _main_window is None:
+            # 首次创建窗口
+            root = tk.Tk()
+            root.title("IDM Agent 配置")
+            root.geometry("700x600")
+            root.resizable(True, True)
+
+            # 居中
+            root.update_idletasks()
+            x = (root.winfo_screenwidth() // 2) - (700 // 2)
+            y = (root.winfo_screenheight() // 2) - (600 // 2)
+            root.geometry(f"700x600+{x}+{y}")
+
+            # 关闭窗口时隐藏而非销毁
+            def on_closing():
+                root.withdraw()  # 隐藏窗口
+            root.protocol("WM_DELETE_WINDOW", on_closing)
+
+            # 构建 UI（和原来一样）
+            notebook = ttk.Notebook(root)
+            notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+            # === 基本设置页 ===
+            basic_frame = ttk.Frame(notebook)
+            notebook.add(basic_frame, text="基本设置")
+
+            idm_path_var = tk.StringVar(value=config_manager.config['idm_path'])
+            ttk.Label(basic_frame, text="IDM路径:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+            idm_path_entry = ttk.Entry(basic_frame, textvariable=idm_path_var, width=50)
+            idm_path_entry.grid(row=0, column=1, padx=5, pady=5)
+            ttk.Button(basic_frame, text="浏览", command=lambda: browse_idm_path(idm_path_var)).grid(row=0, column=2, padx=5, pady=5)
+
+
+            ttk.Label(basic_frame, text="监听模式:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+            local_only_var = tk.BooleanVar(value=config_manager.config['listen_local_only'])
+            ttk.Checkbutton(basic_frame, text="仅本地访问", variable=local_only_var).grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
+
+            ttk.Label(basic_frame, text="IDM自动下载:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+            auto_download_var = tk.BooleanVar(value=config_manager.config['idm_auto_download'])
+            ttk.Checkbutton(basic_frame, text="启用", variable=auto_download_var).grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
+
+            ttk.Label(basic_frame, text="开机自启:").grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)
+            auto_start_var = tk.BooleanVar(value=config_manager.config['auto_start'])
+            ttk.Checkbutton(basic_frame, text="启用", variable=auto_start_var, command=toggle_auto_start).grid(row=3, column=1, sticky=tk.W, padx=5, pady=5)
+
+            # === 安全设置页 ===
+            security_frame = ttk.Frame(notebook)
+            notebook.add(security_frame, text="安全设置")
+
+            secret_actual_var = tk.StringVar()
+            secret_display_var = tk.StringVar()
+
+            ttk.Label(security_frame, text="密钥:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+            secret_container = ttk.Frame(security_frame)
+            secret_container.grid(row=0, column=1, columnspan=2, sticky=tk.EW, padx=5, pady=5)
+
+            secret_masked_entry = ttk.Entry(secret_container, textvariable=secret_display_var, width=32, state="readonly")
+            secret_masked_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            button_container = ttk.Frame(secret_container)
+            button_container.pack(side=tk.RIGHT, padx=(5, 0))
+
+            def toggle_secret_visibility():
+                actual = secret_actual_var.get()
+                if visibility_btn.cget("text") == "显示":
+                    secret_display_var.set(actual)
+                    visibility_btn.config(text="隐藏")
+                else:
+                    secret_display_var.set("*" * len(actual))
+                    visibility_btn.config(text="显示")
+
+            def copy_secret():
+                actual = secret_actual_var.get()
+                if actual:
+                    root.clipboard_clear()
+                    root.clipboard_append(actual)
+                    messagebox.showinfo("提示", "密钥已复制到剪贴板", parent=root)
+                else:
+                    messagebox.showwarning("警告", "没有密钥可复制", parent=root)
+
+            def generate_new_secret():
+                new_secret = generate_secret_key()
+                secret_actual_var.set(new_secret)
+                messagebox.showinfo("提示", "新密钥已生成", parent=root)
+
+            visibility_btn = ttk.Button(button_container, text="显示", command=toggle_secret_visibility)
+            copy_btn = ttk.Button(button_container, text="复制", command=copy_secret)
+            generate_btn = ttk.Button(button_container, text="生成", command=generate_new_secret)
+            visibility_btn.pack(side=tk.LEFT, padx=2)
+            copy_btn.pack(side=tk.LEFT, padx=2)
+            generate_btn.pack(side=tk.LEFT, padx=2)
+
+            secret_actual_var.set(config_manager.get_secret_key())
+            secret_display_var.set("*" * len(secret_actual_var.get()))
+            secret_actual_var.trace_add("write", lambda *a: (
+                secret_display_var.set(secret_actual_var.get() if visibility_btn.cget("text") == "隐藏" else "*" * len(secret_actual_var.get()))
+            ))
+
+            max_failures_var = tk.IntVar(value=config_manager.config['max_failures'])
+            ban_duration_var = tk.IntVar(value=config_manager.config['ban_duration'])
+            time_window_var = tk.IntVar(value=config_manager.config['time_window'])
+
+            ttk.Label(security_frame, text="最大失败次数:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+            ttk.Spinbox(security_frame, from_=1, to=100, textvariable=max_failures_var).grid(row=2, column=1, padx=5, pady=5)
+
+            ttk.Label(security_frame, text="封禁时长(秒):").grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)
+            ttk.Spinbox(security_frame, from_=60, to=86400, textvariable=ban_duration_var).grid(row=3, column=1, padx=5, pady=5)
+
+            ttk.Label(security_frame, text="时间窗口(秒):").grid(row=4, column=0, sticky=tk.W, padx=5, pady=5)
+            ttk.Spinbox(security_frame, from_=10, to=300, textvariable=time_window_var).grid(row=4, column=1, padx=5, pady=5)
+
+            # === 黑名单管理页 ===
+            blacklist_frame = ttk.Frame(notebook)
+            notebook.add(blacklist_frame, text="黑名单管理")
+
+            main_container = ttk.Frame(blacklist_frame)
+            main_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+            text_frame = ttk.Frame(main_container)
+            text_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+            blacklist_text = tk.Text(text_frame, height=15, state=tk.DISABLED)
+            scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=blacklist_text.yview)
+            blacklist_text.configure(yscrollcommand=scrollbar.set)
+            blacklist_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+            button_frame = ttk.Frame(main_container, width=100)
+            button_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
+            button_frame.pack_propagate(False)
+
+            def refresh_blacklist():
+                blacklist_text.config(state=tk.NORMAL)
+                blacklist_text.delete(1.0, tk.END)
+                blacklist = load_blacklist()
+                for ip, info in blacklist.items():
+                    line = f"{ip} | {info['reason']} | {info['timestamp']}\n"
+                    blacklist_text.insert(tk.END, line)
+                blacklist_text.config(state=tk.DISABLED)
+
+            def add_to_blacklist_manual():
+                ip = simpledialog.askstring("添加IP", "请输入要封禁的IP地址:", parent=root)
+                if ip:
+                    if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', ip):
+                        messagebox.showerror("错误", "IP地址格式不正确", parent=root)
+                        return
+                    add_to_blacklist(ip, "手动添加")
+                    refresh_blacklist()
+
+            def delete_from_blacklist():
+                try:
+                    selected = blacklist_text.get(tk.SEL_FIRST, tk.SEL_LAST)
+                    ip = selected.split(' | ')[0].strip()
+                    blacklist = load_blacklist()
+                    if ip in blacklist:
+                        del blacklist[ip]
+                        save_blacklist(blacklist)
+                        refresh_blacklist()
+                        messagebox.showinfo("成功", f"IP {ip} 已移除", parent=root)
+                    else:
+                        messagebox.showwarning("警告", "未找到选中的IP", parent=root)
+                except tk.TclError:
+                    messagebox.showwarning("警告", "请先选中要删除的IP条目", parent=root)
+
+            def clear_blacklist():
+                if messagebox.askyesno("确认", "确定要清空所有黑名单吗？", parent=root):
+                    save_blacklist({})
+                    refresh_blacklist()
+
+            ttk.Button(button_frame, text="刷新", command=refresh_blacklist).pack(fill=tk.X, pady=2)
+            ttk.Button(button_frame, text="添加IP", command=add_to_blacklist_manual).pack(fill=tk.X, pady=2)
+            ttk.Button(button_frame, text="删除选中", command=delete_from_blacklist).pack(fill=tk.X, pady=2)
+            ttk.Button(button_frame, text="清空", command=clear_blacklist).pack(fill=tk.X, pady=2)
+
+            refresh_blacklist()
+
+            def save_settings():
+                idm_path = idm_path_var.get()
+                if not os.path.isfile(idm_path):
+                    messagebox.showerror("错误", f"IDM程序不存在: {idm_path}", parent=root)
+                    return
+                if os.path.basename(idm_path).lower() != "idman.exe":
+                    messagebox.showwarning("警告", f"IDM程序文件名应为 IDMan.exe，当前为: {os.path.basename(idm_path)}", parent=root)
+                    return
+
+                old_listen = config_manager.config['listen_local_only']
+                old_secret = config_manager.config['secret_key']
+
+                config_manager.config.update({
+                    'idm_path': idm_path,
+                    'listen_local_only': local_only_var.get(),
+                    'idm_auto_download': auto_download_var.get(),
+                    'auto_start': auto_start_var.get(),
+                    'max_failures': max_failures_var.get(),
+                    'ban_duration': ban_duration_var.get(),
+                    'time_window': time_window_var.get(),
+                    'secret_key': secret_actual_var.get()
+                })
+                config_manager.save_config()
+
+                need_restart = (old_listen != config_manager.config['listen_local_only'] or
+                            old_secret != config_manager.config['secret_key'])
+
+                if need_restart:
+                    def ask_restart():
+                        if messagebox.askyesno("重启服务", "配置更改需要重启Web服务才能生效，是否立即重启？", parent=root):
+                            restart_flask_app()
+                    threading.Thread(target=ask_restart, daemon=True).start()
+                else:
+                    messagebox.showinfo("成功", "设置已保存", parent=root)
+
+            ttk.Button(root, text="保存设置", command=save_settings).pack(pady=10)
+
+            _main_window = root  # 保存全局引用
+            root.mainloop()
+
+        else:
+            # 已存在窗口：恢复显示并聚焦
+            _main_window.deiconify()      # 取消最小化
+            _main_window.lift()           # 提升到顶层
+            _main_window.focus_force()    # 强制获取焦点（关键！）
+            _main_window.attributes('-topmost', True)
+            _main_window.after(100, lambda: _main_window.attributes('-topmost', False))  # 短暂置顶后取消
+
+
+    def browse_idm_path(var):
+        """浏览IDM路径"""
+        # 创建一个隐藏的根窗口用于文件对话框，确保对话框有父窗口
+        temp_root = tk.Tk()
+        temp_root.withdraw()  # 隐藏这个临时窗口
+        temp_root.call('wm', 'attributes', '.', '-topmost', True)
+        
+        path = filedialog.askopenfilename(
+            parent=temp_root,
+            title="选择IDM程序",
+            filetypes=[("EXE files", "*.exe"), ("All files", "*.*")]
+        )
+        
+        # 销毁临时窗口
+        temp_root.destroy()
+        
+        if path:
+            var.set(path)
+    
+    def toggle_auto_start():
+        """切换开机自启"""
+        key = winreg.HKEY_CURRENT_USER
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        
+        try:
+            registry_key = winreg.OpenKey(key, key_path, 0, winreg.KEY_WRITE)
+            if config_manager.config['auto_start']:
+                # 删除自启项
+                winreg.DeleteValue(registry_key, "IDMAgent")
+            else:
+                # 添加自启项
+                exe_path = os.path.abspath(sys.argv[0])
+                winreg.SetValueEx(registry_key, "IDMAgent", 0, winreg.REG_SZ, exe_path)
+            winreg.CloseKey(registry_key)
+            
+            config_manager.config['auto_start'] = not config_manager.config['auto_start']
+            config_manager.save_config()
+        except Exception as e:
+            logger.error(f"设置开机自启失败: {e}")
+            # 创建一个隐藏的根窗口用于错误对话框
+            temp_root = tk.Tk()
+            temp_root.withdraw()  # 隐藏这个临时窗口
+            messagebox.showerror("错误", f"设置开机自启失败: {e}", parent=temp_root)
+            temp_root.destroy()
+    
+    def quit_app(icon, item):
+        """退出应用"""
+        # 设置关闭事件
+        shutdown_event.set()
+        # 关闭托盘图标
+        icon.stop()
+        # 退出程序
+        os._exit(0)
     
     # 创建托盘图标
     image = create_image()
-    
-    # 创建托盘菜单
     menu = (
-        pystray.MenuItem("打开 Web UI", open_web_ui),
-        pystray.MenuItem(
-            "开机自动启动",
-            toggle_autostart,
-            checked=lambda item: is_autostart_enabled()
-        ),
-        pystray.MenuItem(
-            "IDM自动下载",
-            toggle_idm_auto_download,
-            checked=lambda item: is_idm_auto_download()
-        ),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("显示当前密钥", show_secret_key),
-        pystray.MenuItem("重新生成密钥", regenerate_secret_key),
-        pystray.MenuItem("设置 IDM 路径", set_idm_path),
-        pystray.Menu.SEPARATOR,
-        pystray.MenuItem("退出", quit_app)
+        item('打开配置', show_main_window),
+        item('退出', quit_app),
     )
     
-    # 启动托盘
-    icon = pystray.Icon("IDM-Agent", image, "IDM 下载代理", menu)
+    icon = pystray.Icon("IDM Agent", image, "IDM Agent", menu)
+    return icon
+
+
+def main():
+    """主函数"""
+    logger.info("IDM Agent 启动中...")
+    
+    # 检查是否已生成密钥
+    if not config_manager.get_secret_key():
+        secret = generate_secret_key()
+        config_manager.config['secret_key'] = secret
+        config_manager.save_config()
+        logger.info("已生成新密钥，请在配置界面查看")
+    
+    # 启动Flask应用
+    global flask_thread
+    flask_thread = threading.Thread(target=run_flask_app, daemon=True)
+    flask_thread.start()
+    
+    # 创建并启动托盘图标
+    icon = create_tray_icon()
     icon.run()
 
-# --- 入口点 ---
-if __name__ == '__main__':
-    # 设置tkinter高清显示
-    try:
-        tk.CallWrapper().func = lambda *args: None  # 修复高DPI问题
-        if hasattr(tk, 'tk') and tk.tk.call('tk', 'scaling') < 1.0:
-            tk.tk.call('tk', 'scaling', 1.2)
-    except:
-        pass
-    
+if __name__ == "__main__":
     main()
-
-# 打包
-# pyinstaller --onefile --windowed --name IDM-Agent main.py

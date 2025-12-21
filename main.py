@@ -1,4 +1,4 @@
-
+# -*- coding: utf-8 -*-
 import os
 import sys
 import json
@@ -38,7 +38,7 @@ DEFAULT_CONFIG = {
     "idm_path": r"C:\Program Files (x86)\Internet Download Manager\IDMan.exe",
     "listen_local_only": True,
     "auto_start": False,
-    "idm_auto_download": True,
+    "idm_auto_download": False,
     "max_failures": 5,
     "ban_duration": 3600,
     "time_window": 60
@@ -389,6 +389,9 @@ def run_flask_app():
 
 def restart_flask_app():
     """重启Flask应用以应用新配置"""
+    threading.Thread(target=_restart_flask_app, daemon=True).start()
+
+def _restart_flask_app():
     global flask_thread, shutdown_event
     
     # 设置关闭事件，让当前线程结束
@@ -413,15 +416,25 @@ _main_window = None
 def create_tray_icon():
     """创建系统托盘图标"""
     def create_image():
-        # 创建一个简单的图标
-        width = 64
-        height = 64
-        image = Image.new('RGB', (width, height), color=(41, 128, 185))
-        draw = ImageDraw.Draw(image)
+        ICON_SIZE = (32, 32)
+        BG_COLOR = (255, 255, 255)
+        CROSS_COLOR = (74, 108, 247)  # 使用主色调
+        LINE_WIDTH = 4
+        PADDING = 2
         
-        # 绘制简单的IDM标志
-        draw.rectangle([10, 10, 54, 54], outline=(255, 255, 255), width=3)
-        draw.text((20, 25), "IDM", fill=(255, 255, 255))
+        image = Image.new("RGB", ICON_SIZE, BG_COLOR)
+        draw = ImageDraw.Draw(image)
+        center_x = ICON_SIZE[0] / 2 - 0.5
+        center_y = ICON_SIZE[1] / 2 - 0.5
+        
+        # 绘制十字线
+        horizontal_start = (PADDING, center_y)
+        horizontal_end = (ICON_SIZE[0] - PADDING, center_y)
+        vertical_start = (center_x, PADDING)
+        vertical_end = (center_x, ICON_SIZE[1] - PADDING)
+        
+        draw.line([horizontal_start, horizontal_end], fill=CROSS_COLOR, width=LINE_WIDTH, joint="round")
+        draw.line([vertical_start, vertical_end], fill=CROSS_COLOR, width=LINE_WIDTH, joint="round")
         
         return image
     
@@ -455,24 +468,111 @@ def create_tray_icon():
             basic_frame = ttk.Frame(notebook)
             notebook.add(basic_frame, text="基本设置")
 
+            # IDM路径设置
             idm_path_var = tk.StringVar(value=config_manager.config['idm_path'])
             ttk.Label(basic_frame, text="IDM路径:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
             idm_path_entry = ttk.Entry(basic_frame, textvariable=idm_path_var, width=50)
             idm_path_entry.grid(row=0, column=1, padx=5, pady=5)
+            
+            # 保存IDM路径的回调函数
+            def save_idm_path(*args):
+                path = idm_path_var.get()
+                if path:
+                    if os.path.isfile(path) and os.path.basename(path).lower() == "idman.exe":
+                        config_manager.config['idm_path'] = path
+                        config_manager.save_config()
+                    else:
+                        # 恢复原有值
+                        idm_path_var.set(config_manager.config['idm_path'])
+                        if not os.path.isfile(path):
+                            messagebox.showerror("错误", f"IDM程序不存在: {path}", parent=root)
+                        else:
+                            messagebox.showwarning("警告", f"IDM程序文件名应为 IDMan.exe，当前为: {os.path.basename(path)}", parent=root)
+            
+            idm_path_var.trace_add('write', save_idm_path)
+            
+            def browse_idm_path(var):
+                """浏览IDM路径"""
+                # 创建一个隐藏的根窗口用于文件对话框，确保对话框有父窗口
+                temp_root = tk.Tk()
+                temp_root.withdraw()  # 隐藏这个临时窗口
+                temp_root.call('wm', 'attributes', '.', '-topmost', True)
+                
+                path = filedialog.askopenfilename(
+                    parent=temp_root,
+                    title="选择IDM程序",
+                    filetypes=[("EXE files", "*.exe"), ("All files", "*.*")]
+                )
+                
+                # 销毁临时窗口
+                temp_root.destroy()
+                
+                if path:
+                    var.set(path)
+            
             ttk.Button(basic_frame, text="浏览", command=lambda: browse_idm_path(idm_path_var)).grid(row=0, column=2, padx=5, pady=5)
 
-
+            # 监听模式设置
             ttk.Label(basic_frame, text="监听模式:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
             local_only_var = tk.BooleanVar(value=config_manager.config['listen_local_only'])
+            
+            def save_listen_mode(*args):
+                old_value = config_manager.config['listen_local_only']
+                new_value = local_only_var.get()
+                if old_value != new_value:
+                    config_manager.config['listen_local_only'] = new_value
+                    config_manager.save_config()
+                    # 询问是否重启服务
+                    if messagebox.askyesno("重启服务", "监听模式更改需要重启Web服务才能生效，是否立即重启？", parent=root):
+                        restart_flask_app()
+            
+            local_only_var.trace_add('write', save_listen_mode)
             ttk.Checkbutton(basic_frame, text="仅本地访问", variable=local_only_var).grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
 
-            ttk.Label(basic_frame, text="IDM自动下载:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+            # IDM自动下载设置，默认覆盖文件
+            ttk.Label(basic_frame, text="自动下载:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
             auto_download_var = tk.BooleanVar(value=config_manager.config['idm_auto_download'])
+            
+            def save_auto_download(*args):
+                config_manager.config['idm_auto_download'] = auto_download_var.get()
+                config_manager.save_config()
+            
+            auto_download_var.trace_add('write', save_auto_download)
             ttk.Checkbutton(basic_frame, text="启用", variable=auto_download_var).grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
 
+            # 开机自启设置
             ttk.Label(basic_frame, text="开机自启:").grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)
             auto_start_var = tk.BooleanVar(value=config_manager.config['auto_start'])
-            ttk.Checkbutton(basic_frame, text="启用", variable=auto_start_var, command=toggle_auto_start).grid(row=3, column=1, sticky=tk.W, padx=5, pady=5)
+            
+            def toggle_auto_start(*args):
+                """切换开机自启"""
+                key = winreg.HKEY_CURRENT_USER
+                key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+                
+                try:
+                    registry_key = winreg.OpenKey(key, key_path, 0, winreg.KEY_WRITE)
+                    new_value = auto_start_var.get()
+                    
+                    if new_value:
+                        # 添加自启项
+                        exe_path = os.path.abspath(sys.argv[0])
+                        winreg.SetValueEx(registry_key, "IDMAgent", 0, winreg.REG_SZ, exe_path)
+                    else:
+                        # 删除自启项
+                        winreg.DeleteValue(registry_key, "IDMAgent")
+                    
+                    winreg.CloseKey(registry_key)
+                    
+                    config_manager.config['auto_start'] = new_value
+                    config_manager.save_config()
+                except Exception as e:
+                    logger.error(f"设置开机自启失败: {e}")
+                    # 恢复原有值
+                    auto_start_var.set(config_manager.config['auto_start'])
+                    messagebox.showerror("错误", f"设置开机自启失败: {e}", parent=root)
+            
+            auto_start_var.trace_add('write', toggle_auto_start)
+            ttk.Checkbutton(basic_frame, text="启用", variable=auto_start_var).grid(row=3, column=1, sticky=tk.W, padx=5, pady=5)
 
             # === 安全设置页 ===
             security_frame = ttk.Frame(notebook)
@@ -510,10 +610,18 @@ def create_tray_icon():
                     messagebox.showwarning("警告", "没有密钥可复制", parent=root)
 
             def generate_new_secret():
+                old_secret = secret_actual_var.get()
                 new_secret = generate_secret_key()
                 secret_actual_var.set(new_secret)
-                messagebox.showinfo("提示", "新密钥已生成", parent=root)
+                
+                # 保存新密钥
+                config_manager.config['secret_key'] = new_secret
+                config_manager.save_config()
 
+                # 询问是否重启服务
+                if messagebox.askyesno("重启服务", "密钥更改需要重启Web服务才能生效，是否立即重启？", parent=root):
+                    restart_flask_app()
+                
             visibility_btn = ttk.Button(button_container, text="显示", command=toggle_secret_visibility)
             copy_btn = ttk.Button(button_container, text="复制", command=copy_secret)
             generate_btn = ttk.Button(button_container, text="生成", command=generate_new_secret)
@@ -527,17 +635,37 @@ def create_tray_icon():
                 secret_display_var.set(secret_actual_var.get() if visibility_btn.cget("text") == "隐藏" else "*" * len(secret_actual_var.get()))
             ))
 
+            # 最大失败次数设置
             max_failures_var = tk.IntVar(value=config_manager.config['max_failures'])
-            ban_duration_var = tk.IntVar(value=config_manager.config['ban_duration'])
-            time_window_var = tk.IntVar(value=config_manager.config['time_window'])
-
             ttk.Label(security_frame, text="最大失败次数:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+            
+            def save_max_failures(*args):
+                config_manager.config['max_failures'] = max_failures_var.get()
+                config_manager.save_config()
+            
+            max_failures_var.trace_add('write', save_max_failures)
             ttk.Spinbox(security_frame, from_=1, to=100, textvariable=max_failures_var).grid(row=2, column=1, padx=5, pady=5)
 
+            # 封禁时长设置
+            ban_duration_var = tk.IntVar(value=config_manager.config['ban_duration'])
             ttk.Label(security_frame, text="封禁时长(秒):").grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)
+            
+            def save_ban_duration(*args):
+                config_manager.config['ban_duration'] = ban_duration_var.get()
+                config_manager.save_config()
+            
+            ban_duration_var.trace_add('write', save_ban_duration)
             ttk.Spinbox(security_frame, from_=60, to=86400, textvariable=ban_duration_var).grid(row=3, column=1, padx=5, pady=5)
 
+            # 时间窗口设置
+            time_window_var = tk.IntVar(value=config_manager.config['time_window'])
             ttk.Label(security_frame, text="时间窗口(秒):").grid(row=4, column=0, sticky=tk.W, padx=5, pady=5)
+            
+            def save_time_window(*args):
+                config_manager.config['time_window'] = time_window_var.get()
+                config_manager.save_config()
+            
+            time_window_var.trace_add('write', save_time_window)
             ttk.Spinbox(security_frame, from_=10, to=300, textvariable=time_window_var).grid(row=4, column=1, padx=5, pady=5)
 
             # === 黑名单管理页 ===
@@ -605,43 +733,6 @@ def create_tray_icon():
 
             refresh_blacklist()
 
-            def save_settings():
-                idm_path = idm_path_var.get()
-                if not os.path.isfile(idm_path):
-                    messagebox.showerror("错误", f"IDM程序不存在: {idm_path}", parent=root)
-                    return
-                if os.path.basename(idm_path).lower() != "idman.exe":
-                    messagebox.showwarning("警告", f"IDM程序文件名应为 IDMan.exe，当前为: {os.path.basename(idm_path)}", parent=root)
-                    return
-
-                old_listen = config_manager.config['listen_local_only']
-                old_secret = config_manager.config['secret_key']
-
-                config_manager.config.update({
-                    'idm_path': idm_path,
-                    'listen_local_only': local_only_var.get(),
-                    'idm_auto_download': auto_download_var.get(),
-                    'auto_start': auto_start_var.get(),
-                    'max_failures': max_failures_var.get(),
-                    'ban_duration': ban_duration_var.get(),
-                    'time_window': time_window_var.get(),
-                    'secret_key': secret_actual_var.get()
-                })
-                config_manager.save_config()
-
-                need_restart = (old_listen != config_manager.config['listen_local_only'] or
-                            old_secret != config_manager.config['secret_key'])
-
-                if need_restart:
-                    def ask_restart():
-                        if messagebox.askyesno("重启服务", "配置更改需要重启Web服务才能生效，是否立即重启？", parent=root):
-                            restart_flask_app()
-                    threading.Thread(target=ask_restart, daemon=True).start()
-                else:
-                    messagebox.showinfo("成功", "设置已保存", parent=root)
-
-            ttk.Button(root, text="保存设置", command=save_settings).pack(pady=10)
-
             _main_window = root  # 保存全局引用
             root.mainloop()
 
@@ -653,52 +744,6 @@ def create_tray_icon():
             _main_window.attributes('-topmost', True)
             _main_window.after(100, lambda: _main_window.attributes('-topmost', False))  # 短暂置顶后取消
 
-
-    def browse_idm_path(var):
-        """浏览IDM路径"""
-        # 创建一个隐藏的根窗口用于文件对话框，确保对话框有父窗口
-        temp_root = tk.Tk()
-        temp_root.withdraw()  # 隐藏这个临时窗口
-        temp_root.call('wm', 'attributes', '.', '-topmost', True)
-        
-        path = filedialog.askopenfilename(
-            parent=temp_root,
-            title="选择IDM程序",
-            filetypes=[("EXE files", "*.exe"), ("All files", "*.*")]
-        )
-        
-        # 销毁临时窗口
-        temp_root.destroy()
-        
-        if path:
-            var.set(path)
-    
-    def toggle_auto_start():
-        """切换开机自启"""
-        key = winreg.HKEY_CURRENT_USER
-        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-        
-        try:
-            registry_key = winreg.OpenKey(key, key_path, 0, winreg.KEY_WRITE)
-            if config_manager.config['auto_start']:
-                # 删除自启项
-                winreg.DeleteValue(registry_key, "IDMAgent")
-            else:
-                # 添加自启项
-                exe_path = os.path.abspath(sys.argv[0])
-                winreg.SetValueEx(registry_key, "IDMAgent", 0, winreg.REG_SZ, exe_path)
-            winreg.CloseKey(registry_key)
-            
-            config_manager.config['auto_start'] = not config_manager.config['auto_start']
-            config_manager.save_config()
-        except Exception as e:
-            logger.error(f"设置开机自启失败: {e}")
-            # 创建一个隐藏的根窗口用于错误对话框
-            temp_root = tk.Tk()
-            temp_root.withdraw()  # 隐藏这个临时窗口
-            messagebox.showerror("错误", f"设置开机自启失败: {e}", parent=temp_root)
-            temp_root.destroy()
-    
     def quit_app(icon, item):
         """退出应用"""
         # 设置关闭事件
@@ -741,3 +786,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# 打包
+# pyinstaller --onefile --windowed --name IDM-Agent main.py
